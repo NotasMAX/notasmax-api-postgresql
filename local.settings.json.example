@@ -1,0 +1,13 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "node",
+    "FUNCTIONS_EXTENSION_VERSION": "~4",
+    "PGHOST": "127.0.0.1",
+    "PGPORT": "5432",
+    "PGDATABASE": "notasmax",
+    "PGUSER": "notasmax",
+    "PGPASSWORD": "local_dev_only"
+  }
+}
