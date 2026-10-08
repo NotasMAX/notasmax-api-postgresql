@@ -160,6 +160,48 @@ npm audit
 
 Os registros da invocação contêm somente evento, `invocationId`, resultado e duração.
 
+## Validação de entrada e erros HTTP
+
+O módulo compartilhado `src/http/validation.ts` valida dados com schemas Zod antes que um handler use os valores recebidos. Não há rota demonstrativa registrada. Em handlers futuros, os parâmetros de rota e query podem ser validados com `validateInput`; query usa `request.query` diretamente, e chaves repetidas são representadas como arrays. O corpo JSON é analisado e validado com `validateJsonBody`:
+
+```typescript
+const route = validateInput(routeSchema, request.params, { in: "path" });
+if (!route.success) return route.response;
+
+const query = validateInput(querySchema, request.query, { in: "query" });
+if (!query.success) return query.response;
+
+const body = await validateJsonBody(request, bodySchema);
+if (!body.success) return body.response;
+
+// route.data, query.data e body.data têm os tipos inferidos dos schemas.
+```
+
+Falhas de JSON malformado e de formato/tipo nos parâmetros de rota ou query retornam `400 Bad Request`. JSON válido que não atende ao schema do corpo retorna `422 Unprocessable Content`. As respostas usam `Content-Type: application/problem+json`, `type: about:blank` e `code: VALIDATION_ERROR`; os itens `errors[]` usam somente `FIELD_REQUIRED`, `INVALID_TYPE`, `INVALID_FORMAT`, `VALUE_OUT_OF_RANGE` ou `INVALID_VALUE`.
+
+Os campos legíveis são apresentados em português, sem incluir valores rejeitados ou mensagens internas do validador. Erros do corpo apontam para o campo por JSON Pointer, escapando `~` como `~0` e `/` como `~1`; erros de rota e query identificam o parâmetro pelo nome.
+
+Exemplo de erro de campo:
+
+```json
+{
+  "type": "about:blank",
+  "title": "Conteúdo não processável",
+  "status": 422,
+  "code": "VALIDATION_ERROR",
+  "detail": "O conteúdo enviado não atende aos critérios de validação.",
+  "errors": [
+    {
+      "code": "FIELD_REQUIRED",
+      "detail": "Este campo é obrigatório.",
+      "source": { "in": "body", "pointer": "/nome" }
+    }
+  ]
+}
+```
+
+Esse padrão fica disponível para endpoints aprovados em entregas futuras. Ele não altera `GET /api/v1/health`, cuja resposta de sucesso e falha permanece específica da verificação de saúde.
+
 ## GitHub Actions
 
 O fluxo de integração contínua definido em `.github/workflows/ci.yml` executa `npm ci`, checagem de tipos, compilação, testes e `npm audit`, com um PostgreSQL temporário `postgres:18.6-bookworm`. A execução remota ainda está pendente e não há resultado remoto registrado. Os comandos equivalentes foram executados localmente.
