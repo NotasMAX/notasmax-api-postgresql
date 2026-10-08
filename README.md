@@ -4,17 +4,18 @@
 
 Este repositório contém a fundação da nova API do NotasMAX. A aplicação usa Azure Functions v4 com Node.js e TypeScript. O acesso ao PostgreSQL é feito com Knex e `pg`.
 
-Atualmente, a API oferece a rota de verificação de saúde `GET /api/v1/health`. Ela confirma que a Function está respondendo e que consegue executar `SELECT 1` no PostgreSQL. A base local começa vazia: ainda não há tabelas de domínio, migrações aplicadas, dados migrados do MongoDB ou rotas de negócio.
+Atualmente, a API oferece a rota de verificação de saúde `GET /api/v1/health`. Ela confirma que a Function está respondendo e que consegue executar `SELECT 1` no PostgreSQL. As migrations criam o schema relacional inicial da V1 em uma base vazia; a base local ainda não recebe dados migrados do MongoDB nem rotas de negócio. O primeiro administrador é criado somente quando o seed manual é executado.
 
 A estrutura principal é:
 
 ```text
 src/
-├── database/       # criação e reutilização da conexão Knex/PostgreSQL
+├── database/       # conexão Knex/PostgreSQL e proteção de comandos locais
 ├── functions/      # registro das rotas Azure Functions
 └── health/         # verificação do banco e resposta de saúde da API
 test/               # testes unitários e de integração
-migrations/         # diretório reservado para migrações aprovadas
+migrations/         # migrations forward-only do schema inicial V1
+seed/               # seed manual e interativo do primeiro administrador
 .github/workflows/  # validações automatizadas da CI
 ```
 
@@ -139,13 +140,13 @@ Execute os testes unitários e de tratamento de erros:
 npm test
 ```
 
-O teste de integração PostgreSQL é ignorado por padrão na execução unitária. Com o PostgreSQL local iniciado, execute:
+Os testes de integração PostgreSQL são ignorados por padrão em `npm test`. Execute:
 
 ```bash
 npm run test:integration
 ```
 
-Esse teste usa `local.settings.json` quando disponível e executa `SELECT 1`; não cria tabelas de domínio nem aplica migrações. Para auditar as dependências registradas no arquivo de lock:
+O comando exige PostgreSQL local em loopback e uma conta com permissão para criar bancos. Ele cria um banco descartável com nome gerado para a execução, aplica toda a sequência de migrations e remove somente esse banco ao terminar. O banco configurado para desenvolvimento não é usado como alvo de testes nem é removido. Para auditar as dependências registradas no arquivo de lock:
 
 ```bash
 npm audit
@@ -162,13 +163,26 @@ Os registros da invocação contêm somente evento, `invocationId`, resultado e 
 
 ## GitHub Actions
 
-O fluxo de integração contínua definido em `.github/workflows/ci.yml` executa `npm ci`, checagem de tipos, compilação, testes e `npm audit`, com um PostgreSQL temporário `postgres:18.6-bookworm`. A execução remota ainda está pendente e não há resultado remoto registrado. Os comandos equivalentes foram executados localmente.
+O fluxo de integração contínua definido em `.github/workflows/ci.yml` executa `npm ci`, checagem de tipos, compilação, testes e `npm audit`, com um PostgreSQL `postgres:18.6-bookworm`. Os resultados de cada execução local ou remota são registrados no relatório DGF correspondente.
 
-## Migrações e funcionalidades disponíveis
+## Migrations e primeiro administrador
 
-O `knexfile.cjs` e o diretório `migrations/` preparam o projeto para futuras migrações aprovadas. Nenhuma migração foi criada ou executada, e ainda não há estrutura de tabelas de domínio.
+As migrations criam as 16 tabelas de domínio da matriz física V1, agrupadas por assunto. Consulte o estado e aplique-as à base local com:
 
-Não execute os comandos de migração antes de a estrutura do banco ser definida e as migrações serem autorizadas. Mesmo sem migrações de domínio, o Knex pode criar tabelas internas de controle.
+```bash
+npm run db:migrate:status
+npm run db:migrate:latest
+```
+
+Os comandos de migration e seed aceitam somente hosts de loopback (`127.0.0.0/8`, `::1` ou `localhost`) e falham para hosts remotos. Use `PGHOST=127.0.0.1` na configuração local. Esta fase é forward-only: não há comando de rollback e todo `down` de migration falha antes de alterar o schema.
+
+O seed do primeiro administrador é manual e interativo:
+
+```bash
+npm run db:seed:admin
+```
+
+O seed solicita nome completo e e-mail; a senha é digitada sem eco no terminal, não há senha padrão e uma execução é recusada quando já existe administrador ativo. A senha é armazenada como hash Argon2id com os parâmetros aprovados. O seed deve ser executado em uma base local depois das migrations.
 
 Atualmente, a API não implementa regras de negócio, autenticação, rotas para a aplicação web e o aplicativo móvel, publicação na Azure ou migração de dados do MongoDB.
 
