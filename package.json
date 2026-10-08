@@ -11,14 +11,15 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "func start",
-    "test": "node --require ./test/load-local-settings.cjs --test ./test/health.test.cjs ./test/postgres.integration.test.cjs",
+    "test": "node --require ./test/load-local-settings.cjs --test ./test/health.test.cjs ./test/database-safety.test.cjs ./test/postgres.integration.test.cjs",
     "test:integration": "node ./test/run-integration-tests.cjs",
     "db:migrate:latest": "knex migrate:latest --knexfile knexfile.cjs --env development",
     "db:migrate:status": "knex migrate:list --knexfile knexfile.cjs --env development",
-    "db:migrate:rollback": "knex migrate:rollback --knexfile knexfile.cjs --env development"
+    "db:seed:admin": "node ./seed/admin.cjs"
   },
   "dependencies": {
     "@azure/functions": "4.16.5",
+    "argon2": "0.45.1",
     "knex": "3.3.0",
     "pg": "8.23.0",
     "zod": "4.6.5"

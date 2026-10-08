@@ -1,5 +1,10 @@
+const { assertLoopbackHost } = require("./src/database/local-only.cjs");
+
+const host = process.env.PGHOST || "127.0.0.1";
+assertLoopbackHost(host);
+
 const connection = {
-  host: process.env.PGHOST || "127.0.0.1",
+  host,
   port: Number(process.env.PGPORT || 5432),
   database: process.env.PGDATABASE || "notasmax",
   user: process.env.PGUSER || "notasmax",
