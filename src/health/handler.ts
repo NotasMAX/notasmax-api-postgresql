@@ -17,7 +17,7 @@ export function createHealthHandler(probe: HealthProbe) {
     try {
       healthy = await probe();
     } catch {
-      healthy = false;
+      // The default false value represents a failed or unavailable probe.
     }
 
     const durationMs = Math.max(0, Date.now() - startedAt);

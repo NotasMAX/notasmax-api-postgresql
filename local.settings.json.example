@@ -8,6 +8,7 @@
     "PGPORT": "5432",
     "PGDATABASE": "notasmax",
     "PGUSER": "notasmax",
-    "PGPASSWORD": "local_dev_only"
+    "PGPASSWORD": "local_dev_only",
+    "NOTASMAX_WEB_ORIGINS": "http://localhost:5173"
   }
 }

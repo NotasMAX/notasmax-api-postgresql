@@ -143,7 +143,7 @@ async function runSeed({
     await createInitialAdmin({ knex: database, name, email, password });
     output.write("Initial administrator created.\n");
   } finally {
-    password = "";
+    password = ""; // eslint-disable-line no-useless-assignment -- release the local password reference after use
     if (!injectedDatabase) await database.destroy();
   }
 }

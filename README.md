@@ -4,7 +4,7 @@
 
 Este repositório contém a fundação da nova API do NotasMAX. A aplicação usa Azure Functions v4 com Node.js e TypeScript. O acesso ao PostgreSQL é feito com Knex e `pg`.
 
-Atualmente, a API oferece a rota de verificação de saúde `GET /api/v1/health`. Ela confirma que a Function está respondendo e que consegue executar `SELECT 1` no PostgreSQL. As migrations criam o schema relacional inicial da V1 em uma base vazia; a base local ainda não recebe dados migrados do MongoDB nem rotas de negócio. O primeiro administrador é criado somente quando o seed manual é executado.
+Atualmente, a API oferece a rota de verificação de saúde `GET /api/v1/health` e as rotas de sessão administrativa aprovadas nesta fase. A verificação de saúde confirma que a Function está respondendo e que consegue executar `SELECT 1` no PostgreSQL. As migrations criam o schema relacional inicial da V1 em uma base vazia; a base local ainda não recebe dados migrados do MongoDB nem rotas de negócio. O primeiro administrador é criado somente quando o seed manual é executado.
 
 A estrutura principal é:
 
@@ -12,6 +12,7 @@ A estrutura principal é:
 src/
 ├── database/       # conexão Knex/PostgreSQL e proteção de comandos locais
 ├── functions/      # registro das rotas Azure Functions
+├── auth/           # autenticação administrativa, sessões e autorização server-side
 └── health/         # verificação do banco e resposta de saúde da API
 test/               # testes unitários e de integração
 migrations/         # migrations forward-only do schema inicial V1
@@ -19,7 +20,7 @@ seed/               # seed manual e interativo do primeiro administrador
 .github/workflows/  # validações automatizadas da CI
 ```
 
-## Como a API funciona hoje
+## Fluxo da verificação de saúde
 
 ```text
 Cliente HTTP
@@ -59,10 +60,10 @@ if (-not (Test-Path local.settings.json)) { Copy-Item local.settings.json.exampl
 npm ci
 docker compose up -d postgres
 npm run build
-npm start
+npm start -- --cors http://localhost:5173 --cors-credentials
 ```
 
-A compilação com `npm run build` gera os arquivos JavaScript em `dist/`, de onde o ambiente do Azure Functions carrega a Function. Deixe `npm start` em execução no terminal. Em outro terminal, consulte a rota:
+A compilação com `npm run build` gera os arquivos JavaScript em `dist/`, de onde o ambiente do Azure Functions carrega a Function. Deixe o comando Core Tools acima em execução no terminal. Em outro terminal, consulte a rota:
 
 ```powershell
 Invoke-RestMethod -Method Get -Uri 'http://localhost:7071/api/v1/health'
@@ -90,7 +91,7 @@ test -f local.settings.json || cp local.settings.json.example local.settings.jso
 npm ci
 docker compose up -d postgres
 npm run build
-npm start
+npm start -- --cors http://localhost:5173 --cors-credentials
 ```
 
 Em outro terminal, consulte a rota:
@@ -110,6 +111,7 @@ Os arquivos `.env` e `local.settings.json` são locais e ignorados pelo Git. Nã
 | `PGDATABASE` | Banco de desenvolvimento | `notasmax` |
 | `PGUSER` | Usuário de desenvolvimento | `notasmax` |
 | `PGPASSWORD` | Senha local de desenvolvimento | `local_dev_only` |
+| `NOTASMAX_WEB_ORIGINS` | Origens exatas autorizadas para mutações com sessão | `http://localhost:5173` |
 
 O Docker Compose lê `.env` para configurar o contêiner PostgreSQL. O Azure Functions Core Tools e o carregador de testes leem `local.settings.json`. Variáveis já definidas no ambiente do processo prevalecem sobre os exemplos locais.
 
@@ -125,14 +127,25 @@ Para remover também o volume e todos os dados locais do banco:
 docker compose down -v
 ```
 
+## CORS e sessão administrativa local
+
+O website usa Vite, cuja porta local padrão é `5173`. Mantenha essa origem exata em `NOTASMAX_WEB_ORIGINS` no `local.settings.json` e na opção `--cors` do Core Tools, junto com `--cors-credentials`; não use `*`. Se o Vite iniciar em outra porta, atualize ambos os valores para a origem impressa pelo servidor. As origens devem coincidir exatamente, incluindo protocolo, host e porta.
+
+As operações que iniciam e encerram sessões também validam `Origin` e exigem `X-Requested-With: XMLHttpRequest` no servidor. O cookie de sessão é `HttpOnly; Secure; SameSite=None`; o desenvolvimento local usa HTTP em `localhost`, mantendo `Secure`. A validação do cookie no Safari fica para um ambiente HTTPS, conforme o escopo aprovado. As origens HTTPS da Azure devem ser configuradas quando os endereços existirem; nenhuma configuração ou publicação Azure faz parte desta fase.
+
 ## Testes e verificações
 
-Execute a verificação de tipos e a compilação:
+Execute o lint, a verificação de tipos e a compilação:
 
 ```bash
+npm run lint
 npm run typecheck
 npm run build
 ```
+
+O lint usa ESLint com as regras recomendadas para JavaScript e TypeScript e cobre os arquivos mantidos de aplicação, testes, migrations, seed e tooling. Dependências instaladas e saídas geradas em `node_modules/`, `dist/` e `coverage/` são excluídas. A CI executa `npm run lint` como etapa obrigatória.
+
+O lint é um controle complementar para consistência e problemas detectáveis pelas regras configuradas. O NIST SP 800-218 SSDF v1.1 cita linters como um exemplo para consistência de estilo e formatação (PW.5, Exemplo 7) e aborda análise e revisão de código separadamente em PW.7. Isso não significa que ESLint, sozinho, estabeleça conformidade de segurança ou substitua revisão humana, testes, análise de segurança ou auditoria de dependências. Consulte a [publicação do NIST](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-218.pdf) e a [documentação oficial do ESLint](https://eslint.org/docs/latest/about/).
 
 Execute os testes unitários e de tratamento de erros:
 
@@ -205,7 +218,7 @@ Esse padrão fica disponível para endpoints aprovados em entregas futuras. Ele 
 
 ## GitHub Actions
 
-O fluxo de integração contínua definido em `.github/workflows/ci.yml` executa `npm ci`, checagem de tipos, compilação, testes e `npm audit`, com um PostgreSQL `postgres:18.6-bookworm`. Os resultados de cada execução local ou remota são registrados no relatório DGF correspondente.
+O fluxo de integração contínua definido em `.github/workflows/ci.yml` executa `npm ci`, `npm run lint` como etapa obrigatória, checagem de tipos, compilação, testes e `npm audit`, com um PostgreSQL `postgres:18.6-bookworm`. Os resultados de cada execução local ou remota são registrados no relatório DGF correspondente.
 
 ## Migrations e primeiro administrador
 
@@ -226,7 +239,7 @@ npm run db:seed:admin
 
 O seed solicita nome completo e e-mail; a senha é digitada sem eco no terminal, não há senha padrão e uma execução é recusada quando já existe administrador ativo. A senha é armazenada como hash Argon2id com os parâmetros aprovados. O seed deve ser executado em uma base local depois das migrations.
 
-Atualmente, a API não implementa regras de negócio, autenticação, rotas para a aplicação web e o aplicativo móvel, publicação na Azure ou migração de dados do MongoDB.
+Atualmente, a API não implementa regras de negócio nem rotas para a aplicação web e o aplicativo móvel. A autenticação administrativa está disponível somente por sessão na API; a integração web/mobile, a publicação na Azure e a migração de dados do MongoDB continuam fora desta fase.
 
 ## Problemas comuns
 

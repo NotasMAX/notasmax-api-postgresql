@@ -9,9 +9,10 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "lint": "eslint \"**/*.{js,cjs,mjs,jsx,ts,cts,mts,tsx}\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "func start",
-    "test": "node --require ./test/load-local-settings.cjs --test ./test/health.test.cjs ./test/database-safety.test.cjs ./test/postgres.integration.test.cjs",
+    "test": "node --require ./test/load-local-settings.cjs --test ./test/health.test.cjs ./test/auth.test.cjs ./test/database-safety.test.cjs ./test/postgres.integration.test.cjs",
     "test:integration": "node ./test/run-integration-tests.cjs",
     "db:migrate:latest": "knex migrate:latest --knexfile knexfile.cjs --env development",
     "db:migrate:status": "knex migrate:list --knexfile knexfile.cjs --env development",
@@ -25,7 +26,10 @@
     "zod": "4.6.5"
   },
   "devDependencies": {
+    "@eslint/js": "10.0.1",
     "@types/node": "24.19.0",
-    "typescript": "6.0.3"
+    "eslint": "10.12.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.71.1"
   }
 }

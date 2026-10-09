@@ -23,6 +23,17 @@ type ValidationProblemError = {
   source: { in: "body"; pointer: string } | { in: "path" | "query"; name: string };
 };
 
+export type ProblemResponseOptions = {
+  status: number;
+  title: string;
+  detail: string;
+  code?: string;
+  errors?: readonly unknown[];
+  headers?: Record<string, string>;
+};
+
+type JsonBodyRequest = Pick<HttpRequest, "json"> & Partial<Pick<HttpRequest, "body" | "headers">>;
+
 const problemContentType = "application/problem+json";
 const issueDetails: Record<PublicErrorCode, string> = {
   FIELD_REQUIRED: "Este campo é obrigatório.",
@@ -83,17 +94,48 @@ function validationProblem(
   detail: string,
   errors: ValidationProblemError[]
 ): HttpResponseInit {
-  return {
+  return createProblemResponse({
     status,
-    headers: { "content-type": problemContentType },
-    jsonBody: {
-      type: "about:blank",
-      title: status === 400 ? "Requisição inválida" : "Conteúdo não processável",
-      status,
-      code: "VALIDATION_ERROR",
-      detail,
-      errors
-    }
+    title: status === 400 ? "Requisição inválida" : "Conteúdo não processável",
+    code: "VALIDATION_ERROR",
+    detail,
+    errors
+  });
+}
+
+function oversizedRequestProblem(): HttpResponseInit {
+  return createProblemResponse({
+    status: 413,
+    title: "Conteúdo muito grande",
+    detail: "O corpo da requisição excede o tamanho máximo permitido."
+  });
+}
+
+function malformedJsonProblem(): HttpResponseInit {
+  return validationProblem(400, "O corpo da requisição não contém um JSON válido.", [{
+    code: "INVALID_FORMAT",
+    detail: "O corpo da requisição deve conter um JSON válido.",
+    source: { in: "body", pointer: "" }
+  }]);
+}
+
+export function createProblemResponse(options: ProblemResponseOptions): HttpResponseInit {
+  const jsonBody: Record<string, unknown> = {
+    type: "about:blank",
+    title: options.title,
+    status: options.status
+  };
+  if (options.code !== undefined) jsonBody.code = options.code;
+  jsonBody.detail = options.detail;
+  if (options.errors !== undefined) jsonBody.errors = options.errors;
+
+  return {
+    status: options.status,
+    headers: {
+      ...options.headers,
+      "content-type": problemContentType
+    },
+    jsonBody
   };
 }
 
@@ -138,21 +180,48 @@ export function validateInput<Schema extends z.ZodType>(
 }
 
 export async function validateJsonBody<Schema extends z.ZodType>(
-  request: Pick<HttpRequest, "json">,
-  schema: Schema
+  request: JsonBodyRequest,
+  schema: Schema,
+  options: { maxBytes?: number } = {}
 ): Promise<InputValidationResult<Schema>> {
   let input: unknown;
   try {
-    input = await request.json();
+    const maxBytes = options.maxBytes;
+    if (maxBytes !== undefined) {
+      const contentLength = request.headers?.get("content-length");
+      if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > maxBytes) {
+        return { success: false, response: oversizedRequestProblem() };
+      }
+    }
+
+    if (maxBytes === undefined || request.body === undefined || request.body === null) {
+      input = await request.json();
+    } else {
+      const reader = request.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let byteLength = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value.byteLength > maxBytes - byteLength) {
+            void reader.cancel().catch(() => undefined);
+            return { success: false, response: oversizedRequestProblem() };
+          }
+          chunks.push(value);
+          byteLength += value.byteLength;
+        }
+      } finally {
+        reader.releaseLock();
+      }
+
+      input = JSON.parse(new TextDecoder().decode(Buffer.concat(chunks, byteLength)));
+    }
   } catch (error) {
     if (!(error instanceof SyntaxError)) throw error;
     return {
       success: false,
-      response: validationProblem(400, "O corpo da requisição não contém um JSON válido.", [{
-        code: "INVALID_FORMAT",
-        detail: "O corpo da requisição deve conter um JSON válido.",
-        source: { in: "body", pointer: "" }
-      }])
+      response: malformedJsonProblem()
     };
   }
 
