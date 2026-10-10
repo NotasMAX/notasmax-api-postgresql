@@ -4,9 +4,10 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const argon2 = require("argon2");
 const { createAuthHandlers, requireAdminSession } = require("../dist/auth/handler.js");
+const { createAdminAccountHandlers } = require("../dist/auth/admin-account-handler.js");
 const { createAccountLifecycleHandlers } = require("../dist/auth/account-lifecycle-handler.js");
 const { accountActionUrl, createFakeEmailAdapter } = require("../dist/auth/email-transport.js");
-const { createLoginSession } = require("../dist/auth/session-service.js");
+const { createLoginSession, reauthenticateAdministrator } = require("../dist/auth/session-service.js");
 
 const allowedOrigin = "http://localhost:5173";
 const password = "synthetic-unit-password-123";
@@ -535,6 +536,62 @@ test("login hash-change retries stop after the bounded attempt count", async () 
   assert.equal(fixture.state.updates.length, 0);
 });
 
+test("administrator password reauthentication runs Argon2 outside transactions and reuses account lockout", async () => {
+  const fixture = createLoginRaceFixture({
+    id_usuario: "45",
+    email_institucional: "admin@example.test",
+    tipo_perfil: "administrador",
+    nome_completo: "Synthetic Administrator",
+    hash_senha: "synthetic-admin-hash",
+    ativado_em: new Date("2026-10-09T11:00:00.000Z"),
+    excluido_em: null,
+    falhas_login_na_janela: 0,
+    inicio_janela_falhas_login: null,
+    bloqueado_ate: null
+  });
+  const originalVerify = argon2.verify;
+  const transactionsDuringArgon = [];
+  argon2.verify = async () => {
+    transactionsDuringArgon.push(fixture.state.insideTransaction);
+    return true;
+  };
+
+  let authenticated;
+  try {
+    authenticated = await reauthenticateAdministrator(fixture.knex, "45", "synthetic-valid-current-password");
+  } finally {
+    argon2.verify = originalVerify;
+  }
+
+  assert.equal(authenticated, true);
+  assert.deepEqual(transactionsDuringArgon, [false]);
+  assert.deepEqual(fixture.state.updates, [{
+    falhas_login_na_janela: 0,
+    inicio_janela_falhas_login: null,
+    bloqueado_ate: null
+  }]);
+
+  fixture.state.account.falhas_login_na_janela = 4;
+  fixture.state.account.inicio_janela_falhas_login = new Date("2026-10-09T11:59:00.000Z");
+  fixture.state.account.bloqueado_ate = null;
+  fixture.state.updates.length = 0;
+  argon2.verify = async () => {
+    assert.equal(fixture.state.insideTransaction, false);
+    return false;
+  };
+  try {
+    authenticated = await reauthenticateAdministrator(fixture.knex, "45", "synthetic-wrong-current-password");
+  } finally {
+    argon2.verify = originalVerify;
+  }
+
+  assert.equal(authenticated, false);
+  assert.equal(fixture.state.updates.length, 1);
+  assert.equal(fixture.state.updates[0].falhas_login_na_janela, 5);
+  assert.equal(fixture.state.updates[0].bloqueado_ate.toISOString(), "2026-10-09T12:15:00.000Z");
+  assert.equal(fixture.state.sessions.length, 0);
+});
+
 test("administrator guard sanitizes unexpected database errors for future protected handlers", async () => {
   const rawError = "postgres://private-user:private-password@db.example.test/private-db";
   const result = await requireAdminSession({
@@ -577,6 +634,63 @@ test("unexpected database errors become sanitized RFC 9457 responses without log
   assert.equal(body.detail, "Não foi possível concluir a solicitação.");
   const serialized = JSON.stringify(response);
   for (const value of privateValues) assert.equal(serialized.includes(value), false);
+});
+
+test("all administrative account mutations reject Origin and custom-header failures before body or database access", async () => {
+  let databaseCalls = 0;
+  const handlers = createAdminAccountHandlers({
+    getDatabase() {
+      databaseCalls += 1;
+      throw new Error("database access must not happen before browser-request checks");
+    },
+    allowedOrigins: [allowedOrigin]
+  });
+  const mutations = [
+    [handlers.createStudent, {}],
+    [handlers.updateStudent, { studentId: "1" }],
+    [handlers.deleteStudent, { studentId: "1" }],
+    [handlers.createTeacher, {}],
+    [handlers.updateTeacher, { teacherId: "1" }],
+    [handlers.deleteTeacher, { teacherId: "1" }],
+    [handlers.createAdministrator, {}],
+    [handlers.updateAdministrator, { administratorId: "1" }],
+    [handlers.deleteAdministrator, { administratorId: "1" }]
+  ];
+
+  for (const [handler, params] of mutations) {
+    for (const origin of [undefined, "null", "https://attacker.example.test"]) {
+      let jsonCalls = 0;
+      const headers = new Headers({ "x-requested-with": "XMLHttpRequest" });
+      if (origin !== undefined) headers.set("origin", origin);
+      const response = await handler({
+        method: "POST",
+        headers,
+        params,
+        async json() {
+          jsonCalls += 1;
+          return { email: "private-value@example.test" };
+        }
+      }, noContext);
+      assertProblem(response, 403, "ORIGIN_NOT_ALLOWED");
+      assert.equal(jsonCalls, 0);
+      assert.equal(JSON.stringify(response).includes("attacker.example.test"), false);
+    }
+
+    let jsonCalls = 0;
+    const response = await handler({
+      method: "POST",
+      headers: new Headers({ origin: allowedOrigin }),
+      params,
+      async json() {
+        jsonCalls += 1;
+        return { email: "private-value@example.test" };
+      }
+    }, noContext);
+    assertProblem(response, 403, "REQUEST_HEADER_REQUIRED");
+    assert.equal(jsonCalls, 0);
+  }
+
+  assert.equal(databaseCalls, 0);
 });
 
 test("fake email transport requires explicit local mode and an HTTPS host and never displays messages", async () => {

@@ -7,6 +7,7 @@ const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 const ABSOLUTE_TIMEOUT_MS = 8 * 60 * 60 * 1000;
 const FAILURE_WINDOW_MS = 15 * 60 * 1000;
 const LOCKOUT_MS = 15 * 60 * 1000;
+const ACCOUNT_RECHECK_ATTEMPTS = 3;
 
 type AccountRow = {
   id_usuario: string | number;
@@ -29,6 +30,8 @@ type SessionRow = {
 };
 
 type IdentityRow = Pick<AccountRow, "id_usuario" | "tipo_perfil" | "nome_completo">;
+type LoginFailureState = Pick<AccountRow,
+  "falhas_login_na_janela" | "inicio_janela_falhas_login" | "bloqueado_ate">;
 
 export type SessionIdentity = {
   id: string;
@@ -63,12 +66,49 @@ function identity(account: IdentityRow): SessionIdentity {
   };
 }
 
+async function verifyPasswordHash(hash: string | null | undefined, password: string): Promise<boolean> {
+  try {
+    return await argon2.verify(hash || DUMMY_PASSWORD_HASH, password);
+  } catch (error) {
+    if (!hash) throw error;
+    await argon2.verify(DUMMY_PASSWORD_HASH, password);
+    return false;
+  }
+}
+
+function accountIsBlocked(account: Pick<AccountRow, "bloqueado_ate">, now: Date): boolean {
+  return account.bloqueado_ate !== null
+    && asDate(account.bloqueado_ate).getTime() > now.getTime();
+}
+
+function nextLoginFailureState(account: LoginFailureState, now: Date) {
+  const windowStartedAt = account.inicio_janela_falhas_login
+    ? asDate(account.inicio_janela_falhas_login)
+    : undefined;
+  const windowIsCurrent = windowStartedAt !== undefined
+    && windowStartedAt.getTime() > now.getTime() - FAILURE_WINDOW_MS;
+  const failures = windowIsCurrent ? account.falhas_login_na_janela + 1 : 1;
+  return {
+    falhas_login_na_janela: failures,
+    inicio_janela_falhas_login: windowIsCurrent ? windowStartedAt : now,
+    bloqueado_ate: failures >= 5 ? new Date(now.getTime() + LOCKOUT_MS) : null
+  };
+}
+
+function accountIsActiveAdministrator(account: Pick<AccountRow,
+  "tipo_perfil" | "ativado_em" | "excluido_em" | "hash_senha">): boolean {
+  return account.tipo_perfil === "administrador"
+    && account.ativado_em !== null
+    && account.excluido_em === null
+    && account.hash_senha !== null;
+}
+
 export async function createLoginSession(
   knex: Knex,
   credentials: { email: string; password: string },
   previousToken?: string
 ): Promise<LoginResult> {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < ACCOUNT_RECHECK_ATTEMPTS; attempt += 1) {
     const snapshot = await knex("usuario")
       .select(
         "id_usuario",
@@ -85,13 +125,7 @@ export async function createLoginSession(
       .where({ email_institucional: credentials.email })
       .first() as AccountRow | undefined;
 
-    let passwordMatches = false;
-    try {
-      passwordMatches = await argon2.verify(snapshot?.hash_senha || DUMMY_PASSWORD_HASH, credentials.password);
-    } catch (error) {
-      if (!snapshot?.hash_senha) throw error;
-      await argon2.verify(DUMMY_PASSWORD_HASH, credentials.password);
-    }
+    const passwordMatches = await verifyPasswordHash(snapshot?.hash_senha, credentials.password);
     if (!snapshot) return { success: false };
 
     const result = await knex.transaction(async (transaction) => {
@@ -128,30 +162,14 @@ export async function createLoginSession(
       }
 
       const now = await databaseNow(transaction);
-      const blockedUntil = account.bloqueado_ate ? asDate(account.bloqueado_ate) : undefined;
-      if (blockedUntil && blockedUntil.getTime() > now.getTime()) {
+      if (accountIsBlocked(account, now)) {
         return { retry: false as const, login: { success: false } as LoginResult };
       }
 
-      const eligibleAdministrator = account.tipo_perfil === "administrador"
-        && account.ativado_em !== null
-        && account.excluido_em === null
-        && account.hash_senha !== null;
-
-      if (!passwordMatches || !eligibleAdministrator) {
-        const windowStartedAt = account.inicio_janela_falhas_login
-          ? asDate(account.inicio_janela_falhas_login)
-          : undefined;
-        const windowIsCurrent = windowStartedAt !== undefined
-          && windowStartedAt.getTime() > now.getTime() - FAILURE_WINDOW_MS;
-        const failures = windowIsCurrent ? account.falhas_login_na_janela + 1 : 1;
+      if (!passwordMatches || !accountIsActiveAdministrator(account)) {
         await transaction("usuario")
           .where({ id_usuario: account.id_usuario })
-          .update({
-            falhas_login_na_janela: failures,
-            inicio_janela_falhas_login: windowIsCurrent ? windowStartedAt : now,
-            bloqueado_ate: failures >= 5 ? new Date(now.getTime() + LOCKOUT_MS) : null
-          });
+          .update(nextLoginFailureState(account, now));
         return { retry: false as const, login: { success: false } as LoginResult };
       }
 
@@ -190,6 +208,82 @@ export async function createLoginSession(
   }
 
   return { success: false };
+}
+
+export async function reauthenticateAdministrator(
+  knex: Knex,
+  userId: string,
+  password: string
+): Promise<boolean> {
+  for (let attempt = 0; attempt < ACCOUNT_RECHECK_ATTEMPTS; attempt += 1) {
+    const snapshot = await knex("usuario")
+      .select(
+        "id_usuario",
+        "tipo_perfil",
+        "hash_senha",
+        "ativado_em",
+        "excluido_em",
+        "falhas_login_na_janela",
+        "inicio_janela_falhas_login",
+        "bloqueado_ate"
+      )
+      .where({ id_usuario: userId })
+      .first() as Pick<AccountRow,
+        "id_usuario" | "tipo_perfil" | "hash_senha" | "ativado_em" | "excluido_em"
+        | "falhas_login_na_janela" | "inicio_janela_falhas_login" | "bloqueado_ate"> | undefined;
+
+    const passwordMatches = await verifyPasswordHash(snapshot?.hash_senha, password);
+    if (!snapshot) return false;
+
+    const result = await knex.transaction(async (transaction) => {
+      const account = await transaction("usuario")
+        .select(
+          "id_usuario",
+          "tipo_perfil",
+          "hash_senha",
+          "ativado_em",
+          "excluido_em",
+          "falhas_login_na_janela",
+          "inicio_janela_falhas_login",
+          "bloqueado_ate"
+        )
+        .where({ id_usuario: userId })
+        .forUpdate()
+        .first() as Pick<AccountRow,
+          "id_usuario" | "tipo_perfil" | "hash_senha" | "ativado_em" | "excluido_em"
+          | "falhas_login_na_janela" | "inicio_janela_falhas_login" | "bloqueado_ate"> | undefined;
+
+      if (!account || account.hash_senha !== snapshot.hash_senha) {
+        return { retry: true as const, authenticated: false };
+      }
+
+      const now = await databaseNow(transaction);
+      if (accountIsBlocked(account, now) || !accountIsActiveAdministrator(account)) {
+        return { retry: false as const, authenticated: false };
+      }
+
+      if (!passwordMatches) {
+        await transaction("usuario")
+          .where({ id_usuario: account.id_usuario })
+          .update(nextLoginFailureState(account, now));
+        return { retry: false as const, authenticated: false };
+      }
+
+      await transaction("usuario")
+        .where({ id_usuario: account.id_usuario })
+        .update({
+          falhas_login_na_janela: 0,
+          inicio_janela_falhas_login: null,
+          bloqueado_ate: null
+        });
+      return { retry: false as const, authenticated: true };
+    });
+
+    if (result.retry) continue;
+    return result.authenticated;
+  }
+
+  return false;
 }
 
 export async function inspectSession(knex: Knex, token: string): Promise<CurrentSessionResult> {

@@ -1,10 +1,8 @@
 export type AccountEmailKind = "activation" | "password-reset";
 
-export type AccountEmail = {
-  kind: AccountEmailKind;
-  recipient: string;
-  url: string;
-};
+export type AccountEmail =
+  | { kind: AccountEmailKind; recipient: string; url: string }
+  | { kind: "email-change-notice"; recipient: string };
 
 export type EmailTransport = {
   send(message: AccountEmail | undefined): Promise<void>;
@@ -14,6 +12,16 @@ export type FakeEmailAdapter = {
   transport: EmailTransport;
   webBaseUrl: string;
 };
+
+export function resolveAccountEmailAdapter(options: {
+  environment?: Environment;
+  transport?: EmailTransport;
+  webBaseUrl?: string;
+} = {}): FakeEmailAdapter {
+  if (!options.transport) return createFakeEmailAdapter(options.environment);
+  if (!options.webBaseUrl) throw new Error("Account email transport is unavailable.");
+  return { transport: options.transport, webBaseUrl: options.webBaseUrl };
+}
 
 type Environment = Record<string, string | undefined>;
 

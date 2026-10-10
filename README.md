@@ -2,9 +2,9 @@
 
 ## Sobre o projeto
 
-Este repositório contém a fundação da nova API do NotasMAX. A aplicação usa Azure Functions v4 com Node.js e TypeScript. O acesso ao PostgreSQL é feito com Knex e `pg`.
+Este repositório contém a API do NotasMAX, construída com Azure Functions v4, Node.js 24 e TypeScript. O acesso ao PostgreSQL é feito com Knex e `pg`.
 
-Atualmente, a API oferece a rota de verificação de saúde `GET /api/v1/health`, as rotas de sessão administrativa e os fluxos compartilhados de ativação e recuperação de senha. A verificação de saúde confirma que a Function está respondendo e que consegue executar `SELECT 1` no PostgreSQL. As migrations criam o schema relacional inicial da V1 em uma base vazia; a base local ainda não recebe dados migrados do MongoDB nem rotas de CRUD administrativo. O primeiro administrador é criado somente quando o seed manual é executado.
+Atualmente, a API oferece `GET /api/v1/health`, as rotas de sessão administrativa, os fluxos compartilhados de ativação e recuperação de senha e os endpoints administrativos de contas de alunos, professores e administradores. A verificação de saúde confirma que a Function está respondendo e que consegue executar `SELECT 1` no PostgreSQL. As migrations criam o schema relacional inicial da V1 em uma base vazia; não há migração de dados do MongoDB. O primeiro administrador é criado somente quando o seed manual é executado.
 
 A estrutura principal é:
 
@@ -12,7 +12,7 @@ A estrutura principal é:
 src/
 ├── database/       # conexão Knex/PostgreSQL e proteção de comandos locais
 ├── functions/      # registro das rotas Azure Functions
-├── auth/           # autenticação administrativa, sessões e autorização server-side
+├── auth/           # sessões, autorização e ciclo/gestão administrativa de contas
 └── health/         # verificação do banco e resposta de saúde da API
 test/               # testes unitários e de integração
 migrations/         # migrations forward-only do schema inicial V1
@@ -136,7 +136,7 @@ docker compose down -v
 
 O website usa Vite, cuja porta local padrão é `5173`. Mantenha essa origem exata em `NOTASMAX_WEB_ORIGINS` no `local.settings.json` e na opção `--cors` do Core Tools, junto com `--cors-credentials`; não use `*`. Se o Vite iniciar em outra porta, atualize ambos os valores para a origem impressa pelo servidor. As origens devem coincidir exatamente, incluindo protocolo, host e porta.
 
-As operações que iniciam e encerram sessões também validam `Origin` e exigem `X-Requested-With: XMLHttpRequest` no servidor. O cookie de sessão é `HttpOnly; Secure; SameSite=None`; o desenvolvimento local usa HTTP em `localhost`, mantendo `Secure`. A validação do cookie no Safari fica para um ambiente HTTPS, conforme o escopo aprovado. As origens HTTPS da Azure devem ser configuradas quando os endereços existirem; nenhuma configuração ou publicação Azure faz parte desta fase.
+As operações que iniciam e encerram sessões também validam `Origin` e exigem `X-Requested-With: XMLHttpRequest` no servidor. O cookie de sessão é `HttpOnly; Secure; SameSite=None`; o desenvolvimento local usa HTTP em `localhost`, mantendo `Secure`. A validação do cookie no Safari depende de um ambiente HTTPS. As origens HTTPS da Azure devem ser configuradas quando os endereços existirem; publicação e configuração Azure não fazem parte da execução local documentada.
 
 ## Ciclo de vida de conta
 
@@ -148,6 +148,30 @@ As operações que iniciam e encerram sessões também validam `Origin` e exigem
 | `POST /api/v1/admin/users/{userId}/activation-resends` | Reenvia a ativação para conta pendente, exige sessão administrativa, origem permitida e `X-Requested-With`; responde `activationEmailStatus: sent|failed`. |
 
 Os tokens são aleatórios; somente hashes SHA-256 e expirações ficam no PostgreSQL. Cada nova emissão substitui o token anterior do mesmo fluxo. O contador e o início da janela de redefinição são campos aditivos em `usuario`, zerados após login bem-sucedido ou redefinição concluída. Um timer diário da própria Function App remove registros de token expirados. O transporte desta fase é exclusivamente `fake`; `sent` indica aceite pelo adaptador, não entrega. Links tokenizados não aparecem em logs ou respostas.
+
+## Administração de contas
+
+Todas as rotas `/api/v1/admin/*` abaixo exigem sessão ativa de administrador verificada no servidor. Toda mutação também exige `Origin` presente e permitido pela allowlist exata e `X-Requested-With: XMLHttpRequest`; as rejeições ocorrem antes de qualquer acesso ao banco. As respostas seguem RFC 9457 e não incluem erros crus do PostgreSQL.
+
+| Método e rota | Finalidade |
+|---|---|
+| `GET /api/v1/admin/students` | Lista alunos; aceita `search`, `activationStatus`, `enrollmentStatus`, `classId`, `page` e `pageSize`. |
+| `POST /api/v1/admin/students` | Cria aluno pendente e solicita uma tentativa de ativação. Campos: `name`, `email`, `guardianPhone` e `contactPhone` opcional. |
+| `GET`, `PATCH`, `DELETE /api/v1/admin/students/{studentId}` | Consulta dados e matrículas, edita campos cadastrais ou faz exclusão lógica. |
+| `GET /api/v1/admin/teachers` | Lista professores; aceita `search`, `classId`, `subjectId`, `page` e `pageSize`. Quando turma e matéria são informadas juntas, devem corresponder à mesma associação existente. |
+| `POST /api/v1/admin/teachers` | Cria professor pendente. Campos: `name`, `email` e `contactPhone` opcional. |
+| `GET`, `PATCH`, `DELETE /api/v1/admin/teachers/{teacherId}` | Consulta, edita ou faz exclusão lógica do professor. |
+| `GET /api/v1/admin/administrators` | Lista administradores; aceita `search`, `page` e `pageSize`. |
+| `POST /api/v1/admin/administrators` | Cria administrador pendente. Campos: `name`, `email` e `contactPhone` opcional. |
+| `GET`, `PATCH`, `DELETE /api/v1/admin/administrators/{administratorId}` | Consulta, edita ou faz exclusão lógica do administrador. |
+
+As três listas usam busca parcial sem diferenciar maiúsculas/minúsculas em nome ou e-mail, ordenação por nome crescente, `page` padrão `1`, `pageSize` padrão `20` (máximo `100`) e resposta `{ items, pagination: { page, pageSize, totalItems, totalPages } }`. A lista de alunos separa `activationStatus` (`pending`/`activated`) e `enrollmentStatus` (`active`/`no_active_enrollment`); inclui a turma vigente e `enrollmentId` quando houver. Detalhes retornam os telefones disponíveis; o detalhe do aluno inclui o histórico de matrículas.
+
+Criações retornam `201` com `activationEmailStatus: sent|failed`; falha síncrona do transporte fake/local não desfaz o cadastro. E-mail duplicado retorna `409 EMAIL_ALREADY_IN_USE`. `PATCH` aceita campos parciais. Ao mudar o e-mail de outra conta, exige `currentPassword` da pessoa administradora que executa a operação; essa reautenticação usa o mesmo bloqueio de cinco falhas por conta em 15 minutos. O administrador não pode alterar o próprio e-mail por essa rota; a API retorna `422 VALIDATION_ERROR` com `errors[].code: INVALID_VALUE`. O e-mail institucional atual permanece até a pessoa confirmar o novo endereço pelo fluxo de ativação; enquanto isso, a conta fica pendente e não pode iniciar ou usar uma sessão. A alteração de `email_pendente` e a invalidação do token de ativação anterior ocorrem na mesma transação; o novo token e a mensagem são emitidos depois do commit. A API envia uma notificação sem token ao endereço anterior e um link de ativação ao endereço pendente. A confirmação promove o novo endereço e revoga as sessões existentes. Sem mudança de e-mail, a senha atual não é exigida.
+
+As mutações administrativas e os resultados de reautenticação emitem eventos mínimos pelo logger do contexto da Azure Function: `event`, `invocationId`, `result` e `durationMs`. Senhas, tokens, corpo da requisição, dados pessoais desnecessários e erros crus do PostgreSQL não são registrados. Esses eventos não são persistidos no banco de dados.
+
+As exclusões são lógicas e revogam sessões sem apagar vínculos. O aluno só é bloqueado quando tem matrícula ativa e vínculo com simulado realizado (`409 STUDENT_CANNOT_BE_DELETED`); o professor é bloqueado enquanto houver associação a matéria/turma (`409 TEACHER_HAS_LINKED_DATA`). Administradores não podem excluir a própria conta (`409 ADMINISTRATOR_CANNOT_DELETE_SELF`) nem remover o último administrador ativo (`409 LAST_ACTIVE_ADMIN_CANNOT_BE_DELETED`). As associações professor-matéria-turma continuam sendo gerenciadas por endpoints separados e não são criadas ou removidas por estas rotas.
 
 ## Testes e verificações
 
@@ -230,7 +254,7 @@ Exemplo de erro de campo:
 }
 ```
 
-Esse padrão fica disponível para endpoints aprovados em entregas futuras. Ele não altera `GET /api/v1/health`, cuja resposta de sucesso e falha permanece específica da verificação de saúde.
+Esse padrão fica disponível para endpoints de negócio. Ele não altera `GET /api/v1/health`, cuja resposta de sucesso e falha permanece específica da verificação de saúde.
 
 ## GitHub Actions
 
@@ -245,7 +269,7 @@ npm run db:migrate:status
 npm run db:migrate:latest
 ```
 
-Os comandos de migration e seed aceitam somente hosts de loopback (`127.0.0.0/8`, `::1` ou `localhost`) e falham para hosts remotos. Use `PGHOST=127.0.0.1` na configuração local. Esta fase é forward-only: não há comando de rollback e todo `down` de migration falha antes de alterar o schema.
+Os comandos de migration e seed aceitam somente hosts de loopback (`127.0.0.0/8`, `::1` ou `localhost`) e falham para hosts remotos. Use `PGHOST=127.0.0.1` na configuração local. As migrations são forward-only: não há comando de rollback e todo `down` de migration falha antes de alterar o schema.
 
 O seed do primeiro administrador é manual e interativo:
 
@@ -253,9 +277,9 @@ O seed do primeiro administrador é manual e interativo:
 npm run db:seed:admin
 ```
 
-O seed solicita nome completo e e-mail; a senha é digitada sem eco no terminal, não há senha padrão e uma execução é recusada quando já existe administrador ativo. A senha é armazenada como hash Argon2id com os parâmetros aprovados. O seed deve ser executado em uma base local depois das migrations.
+O seed solicita nome completo e e-mail; a senha é digitada sem eco no terminal, não há senha padrão e uma execução é recusada quando já existe administrador ativo. A senha é armazenada como hash Argon2id com os parâmetros configurados. O seed deve ser executado em uma base local depois das migrations.
 
-Esta fase disponibiliza os fluxos de autenticação e ciclo de vida compartilhados na API; CRUD administrativo por perfil, integração web/mobile, publicação na Azure e migração de dados do MongoDB continuam fora desta fase.
+Esta API inclui autenticação, ciclo de vida e operações administrativas de contas de alunos, professores e administradores. As telas web/mobile ainda não estão integradas; o transporte de e-mail permanece fake/local; a publicação na Azure e a migração de dados do MongoDB não fazem parte do funcionamento local.
 
 ## Problemas comuns
 

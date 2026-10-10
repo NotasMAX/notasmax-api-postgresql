@@ -11,7 +11,9 @@ const { Client } = require("pg");
 const { assertLoopbackHost } = require("../src/database/local-only.cjs");
 const { createInitialAdmin } = require("../seed/admin.cjs");
 const { createAuthHandlers, requireAdminSession } = require("../dist/auth/handler.js");
+const { createAdminAccountHandlers } = require("../dist/auth/admin-account-handler.js");
 const { createAccountLifecycleHandlers } = require("../dist/auth/account-lifecycle-handler.js");
+const { deleteAccount, updateAccount } = require("../dist/auth/admin-account-service.js");
 const {
   activateAccount,
   completePasswordReset,
@@ -55,11 +57,11 @@ function connectionFromEnvironment(database) {
   };
 }
 
-function makeKnex(connection) {
+function makeKnex(connection, pool = { min: 0, max: 2, acquireTimeoutMillis: 5000 }) {
   return knexFactory({
     client: "pg",
     connection,
-    pool: { min: 0, max: 2, acquireTimeoutMillis: 5000 },
+    pool,
     migrations: { tableName: "knex_migrations", extension: "js" }
   });
 }
@@ -147,12 +149,28 @@ function accountLifecycleHandlers(database, emailTransport) {
   });
 }
 
-function accountRequest(method, { origin = AUTH_ORIGIN, requestedWith = "XMLHttpRequest", cookie, body, params } = {}) {
+function adminAccountHandlers(database, emailTransport) {
+  return createAdminAccountHandlers({
+    getDatabase: () => database,
+    allowedOrigins: [AUTH_ORIGIN],
+    emailTransport,
+    webBaseUrl: "https://web.example.test"
+  });
+}
+
+function accountRequest(method, {
+  origin = AUTH_ORIGIN,
+  requestedWith = "XMLHttpRequest",
+  cookie,
+  body,
+  params,
+  query
+} = {}) {
   const headers = new Headers();
   if (origin !== undefined) headers.set("origin", origin);
   if (requestedWith !== undefined) headers.set("x-requested-with", requestedWith);
   if (cookie !== undefined) headers.set("cookie", `notasmax_session=${cookie}`);
-  return { method, headers, params, json: async () => body };
+  return { method, headers, params, query, json: async () => body };
 }
 
 function sessionCookie(response) {
@@ -195,6 +213,32 @@ function expectPgCode(promise, code) {
     if (!error) return false;
     return typeof code === "function" ? code(error) : error.code === code;
   });
+}
+
+async function waitForLockWait(database, applicationName) {
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    const { rows } = await database.raw(`
+      SELECT 1
+      FROM pg_stat_activity
+      WHERE application_name = ?
+        AND datname = current_database()
+        AND wait_event_type = 'Lock'
+        AND query ILIKE '%for update%'
+    `, [applicationName]);
+    if (rows.length > 0) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail("A test connection did not reach the expected PostgreSQL row-lock wait.");
+}
+
+function assertProblemResponse(response, status, code) {
+  assert.equal(response.status, status);
+  assert.equal(response.headers["content-type"], "application/problem+json");
+  assert.equal(response.jsonBody.type, "about:blank");
+  assert.equal(response.jsonBody.status, status);
+  assert.equal(response.jsonBody.code, code);
+  return response.jsonBody;
 }
 
 test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a disposable PostgreSQL database", {
@@ -928,6 +972,626 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       assert.ok(await database("token_ativacao").where({ id_usuario: validCleanupId }).first());
     });
 
+    await t.test("administrative account CRUD reuses activation, reauthentication, and logical-delete rules", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("account-crud-admin") });
+      const adminToken = await insertAuthSession(database, administrator.id);
+      const outbox = [];
+      let verifyEmailTransitionAtSend;
+      const handlers = adminAccountHandlers(database, {
+        async send(message) {
+          outbox.push(message);
+          await verifyEmailTransitionAtSend?.(message);
+        }
+      });
+      const createdStudentEmail = newIdentity("api-created-student");
+      const createdStudent = await handlers.createStudent(accountRequest("POST", {
+        cookie: adminToken,
+        body: {
+          name: "Synthetic API Student",
+          email: createdStudentEmail,
+          contactPhone: "+5511999990011",
+          guardianPhone: "+5511999990022"
+        }
+      }), {});
+      assert.equal(createdStudent.status, 201);
+      assert.deepEqual(createdStudent.jsonBody, { activationEmailStatus: "sent" });
+      assert.equal(outbox.length, 1);
+      const studentToken = new URL(outbox[0].url).searchParams.get("token");
+      assert.ok(studentToken);
+      const createdStudentRow = await database("usuario")
+        .where({ email_institucional: createdStudentEmail })
+        .first();
+      assert.equal(createdStudentRow.tipo_perfil, "aluno");
+      assert.equal(createdStudentRow.ativado_em, null);
+      assert.equal(createdStudentRow.hash_senha, null);
+      assert.ok(await database("aluno").where({ id_usuario: createdStudentRow.id_usuario }).first());
+      const persistedActivation = await database("token_ativacao")
+        .where({ id_usuario: createdStudentRow.id_usuario })
+        .first();
+      assert.equal(persistedActivation.hash_token_sha256.equals(hashOpaqueToken(studentToken)), true);
+      assert.equal(JSON.stringify(createdStudent).includes(studentToken), false);
+      assert.equal(JSON.stringify(createdStudent).includes(createdStudentEmail), false);
+
+      const teacherEmail = newIdentity("api-created-teacher");
+      const createdTeacher = await handlers.createTeacher(accountRequest("POST", {
+        cookie: adminToken,
+        body: { name: "Synthetic API Teacher", email: teacherEmail }
+      }), {});
+      assert.equal(createdTeacher.status, 201);
+      assert.deepEqual(createdTeacher.jsonBody, { activationEmailStatus: "sent" });
+      const teacherRow = await database("usuario").where({ email_institucional: teacherEmail }).first();
+      assert.equal(teacherRow.tipo_perfil, "professor");
+      assert.ok(await database("professor").where({ id_usuario: teacherRow.id_usuario }).first());
+
+      const administratorEmail = newIdentity("api-created-admin");
+      const createdAdministrator = await handlers.createAdministrator(accountRequest("POST", {
+        cookie: adminToken,
+        body: { name: "Synthetic API Administrator", email: administratorEmail }
+      }), {});
+      assert.equal(createdAdministrator.status, 201);
+      assert.deepEqual(createdAdministrator.jsonBody, { activationEmailStatus: "sent" });
+      const pendingAdministrator = await database("usuario")
+        .where({ email_institucional: administratorEmail })
+        .first();
+      assert.equal(pendingAdministrator.tipo_perfil, "administrador");
+      assert.equal(pendingAdministrator.ativado_em, null);
+
+      const studentList = await handlers.listStudents(accountRequest("GET", {
+        cookie: adminToken,
+        query: new URLSearchParams({
+          search: "synthetic api student",
+          activationStatus: "pending",
+          enrollmentStatus: "no_active_enrollment",
+          page: "1",
+          pageSize: "10"
+        })
+      }), {});
+      assert.equal(studentList.status, 200);
+      assert.deepEqual(studentList.jsonBody.pagination, {
+        page: 1, pageSize: 10, totalItems: 1, totalPages: 1
+      });
+      assert.equal(studentList.jsonBody.items[0].studentId, String(createdStudentRow.id_usuario));
+      assert.equal(studentList.jsonBody.items[0].currentClass, null);
+      assert.equal(studentList.jsonBody.items[0].enrollmentStatus, "no_active_enrollment");
+
+      const studentDetail = await handlers.getStudent(accountRequest("GET", {
+        cookie: adminToken,
+        params: { studentId: String(createdStudentRow.id_usuario) }
+      }), {});
+      assert.equal(studentDetail.status, 200);
+      assert.equal(studentDetail.jsonBody.guardianPhone, "+5511999990022");
+      assert.equal(studentDetail.jsonBody.enrollments.length, 0);
+      const teacherList = await handlers.listTeachers(accountRequest("GET", {
+        cookie: adminToken,
+        query: new URLSearchParams({ search: "synthetic api teacher" })
+      }), {});
+      assert.equal(teacherList.status, 200);
+      assert.equal(teacherList.jsonBody.items[0].teacherId, String(teacherRow.id_usuario));
+      assert.equal((await handlers.getTeacher(accountRequest("GET", {
+        cookie: adminToken,
+        params: { teacherId: String(teacherRow.id_usuario) }
+      }), {})).jsonBody.activationStatus, "pending");
+      const administratorList = await handlers.listAdministrators(accountRequest("GET", {
+        cookie: adminToken,
+        query: new URLSearchParams({ search: "synthetic api administrator" })
+      }), {});
+      assert.equal(administratorList.status, 200);
+      assert.equal(administratorList.jsonBody.items[0].administratorId, String(pendingAdministrator.id_usuario));
+      assert.equal((await handlers.getAdministrator(accountRequest("GET", {
+        cookie: adminToken,
+        params: { administratorId: String(pendingAdministrator.id_usuario) }
+      }), {})).jsonBody.activationStatus, "pending");
+      const deletePendingAdministrator = await handlers.deleteAdministrator(accountRequest("DELETE", {
+        cookie: adminToken,
+        params: { administratorId: String(pendingAdministrator.id_usuario) }
+      }), {});
+      assert.equal(deletePendingAdministrator.status, 204);
+      assert.ok((await database("usuario").where({ id_usuario: pendingAdministrator.id_usuario }).first()).excluido_em);
+
+      const nonAdminId = await insertStudent(database, newIdentity("account-non-admin"));
+      const nonAdminToken = await insertAuthSession(database, nonAdminId);
+      assertProblemResponse(await handlers.listStudents(accountRequest("GET", {
+        cookie: nonAdminToken,
+        query: new URLSearchParams()
+      }), {}), 404, "RESOURCE_NOT_FOUND");
+      assert.equal(JSON.stringify(await handlers.getStudent(accountRequest("GET", {
+        cookie: "A".repeat(43),
+        params: { studentId: String(createdStudentRow.id_usuario) }
+      }), {})).includes(createdStudentEmail), false);
+
+      const invalid = await handlers.createTeacher(accountRequest("POST", {
+        cookie: adminToken,
+        body: { name: " ", email: "private-invalid-email@example.test" }
+      }), {});
+      assertProblemResponse(invalid, 422, "VALIDATION_ERROR");
+      assert.equal(JSON.stringify(invalid).includes("private-invalid-email"), false);
+      const duplicate = await handlers.createTeacher(accountRequest("POST", {
+        cookie: adminToken,
+        body: { name: "Synthetic Duplicate Teacher", email: teacherEmail }
+      }), {});
+      assertProblemResponse(duplicate, 409, "EMAIL_ALREADY_IN_USE");
+      assert.equal(JSON.stringify(duplicate).includes(teacherEmail), false);
+
+      const renamed = await handlers.updateStudent(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { studentId: String(createdStudentRow.id_usuario) },
+        body: { name: "Synthetic Updated Student", contactPhone: null }
+      }), {});
+      assert.equal(renamed.status, 200);
+      assert.equal(renamed.jsonBody.name, "Synthetic Updated Student");
+      assert.equal(Object.hasOwn(renamed.jsonBody, "contactPhone"), false);
+
+      const changeTargetEmail = newIdentity("email-change-current");
+      const changeTargetId = await insertStudent(database, changeTargetEmail);
+      const previousPasswordHash = await syntheticPasswordHash("synthetic-previous-student-password");
+      await database("usuario").where({ id_usuario: changeTargetId }).update({ hash_senha: previousPasswordHash });
+      const previousSession = await insertAuthSession(database, changeTargetId);
+      const newEmail = newIdentity("email-change-confirmed");
+      const missingReauthentication = await handlers.updateStudent(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { studentId: String(changeTargetId) },
+        body: { email: newEmail }
+      }), {});
+      assertProblemResponse(missingReauthentication, 422, "VALIDATION_ERROR");
+      assert.deepEqual(missingReauthentication.jsonBody.errors[0].source, {
+        in: "body",
+        pointer: "/currentPassword"
+      });
+      assert.equal((await database("usuario").where({ id_usuario: changeTargetId }).first()).email_pendente, null);
+      let transitionObservedAtSend = false;
+      verifyEmailTransitionAtSend = async (message) => {
+        if (message.kind !== "activation" || message.recipient !== newEmail) return;
+        const accountAtSend = await database("usuario").where({ id_usuario: changeTargetId }).first();
+        assert.equal(accountAtSend.email_institucional, changeTargetEmail);
+        assert.equal(accountAtSend.email_pendente, newEmail);
+        assert.equal(accountAtSend.ativado_em, null);
+        const token = new URL(message.url).searchParams.get("token");
+        const tokenRow = await database("token_ativacao").where({ id_usuario: changeTargetId }).first();
+        assert.ok(tokenRow);
+        assert.equal(tokenRow.hash_token_sha256.equals(hashOpaqueToken(token)), true);
+        transitionObservedAtSend = true;
+      };
+      const emailChange = await handlers.updateStudent(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { studentId: String(changeTargetId) },
+        body: { email: newEmail, currentPassword: administrator.password }
+      }), {});
+      assert.equal(emailChange.status, 200);
+      const pendingEmailAccount = await database("usuario").where({ id_usuario: changeTargetId }).first();
+      assert.equal(pendingEmailAccount.email_institucional, changeTargetEmail);
+      assert.equal(pendingEmailAccount.email_pendente, newEmail);
+      assert.equal(pendingEmailAccount.ativado_em, null);
+      assert.equal(pendingEmailAccount.hash_senha, previousPasswordHash);
+      assert.equal(transitionObservedAtSend, true);
+      assert.deepEqual(outbox.slice(-2).map((message) => [message.kind, message.recipient]), [
+        ["activation", newEmail],
+        ["email-change-notice", changeTargetEmail]
+      ]);
+      const activationForNewEmail = outbox.at(-2);
+      const changeToken = new URL(activationForNewEmail.url).searchParams.get("token");
+      const changeTokenRow = await database("token_ativacao").where({ id_usuario: changeTargetId }).first();
+      assert.equal(changeTokenRow.hash_token_sha256.equals(hashOpaqueToken(changeToken)), true);
+      for (const secret of [newEmail, changeToken, administrator.password, previousPasswordHash]) {
+        assert.equal(JSON.stringify(emailChange).includes(secret), false);
+      }
+
+      const lifecycle = accountLifecycleHandlers(database, { async send() {} });
+      const activated = await lifecycle.activate(accountRequest("POST", {
+        body: { token: changeToken, password: "synthetic-reactivated-account-password" }
+      }), {});
+      assert.equal(activated.status, 200);
+      const confirmedEmailAccount = await database("usuario").where({ id_usuario: changeTargetId }).first();
+      assert.equal(confirmedEmailAccount.email_institucional, newEmail);
+      assert.equal(confirmedEmailAccount.email_pendente, null);
+      assert.ok(confirmedEmailAccount.ativado_em);
+      assert.equal(await argon2.verify(confirmedEmailAccount.hash_senha, "synthetic-reactivated-account-password"), true);
+      const revokedEmailChangeSession = await database("sessao")
+        .where({ hash_token_sha256: createHash("sha256").update(previousSession).digest() })
+        .first();
+      assert.ok(revokedEmailChangeSession.revogada_em);
+      assert.equal(JSON.stringify(activated).includes(changeToken), false);
+
+      const duplicateEmailChange = await handlers.updateStudent(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { studentId: String(changeTargetId) },
+        body: { email: teacherEmail, currentPassword: administrator.password }
+      }), {});
+      assertProblemResponse(duplicateEmailChange, 409, "EMAIL_ALREADY_IN_USE");
+      const afterDuplicate = await database("usuario").where({ id_usuario: changeTargetId }).first();
+      assert.equal(afterDuplicate.email_institucional, newEmail);
+      assert.equal(afterDuplicate.email_pendente, null);
+
+      const createFailureEmail = newIdentity("email-failure-account");
+      const failedDeliveryHandlers = adminAccountHandlers(database, {
+        async send() { throw new Error("synthetic-provider-stack-private"); }
+      });
+      const failedDelivery = await failedDeliveryHandlers.createAdministrator(accountRequest("POST", {
+        cookie: adminToken,
+        body: { name: "Synthetic Delivery Failure", email: createFailureEmail }
+      }), {});
+      assert.equal(failedDelivery.status, 201);
+      assert.deepEqual(failedDelivery.jsonBody, { activationEmailStatus: "failed" });
+      assert.ok(await database("usuario").where({ email_institucional: createFailureEmail }).first());
+      assert.equal(JSON.stringify(failedDelivery).includes("synthetic-provider-stack-private"), false);
+
+      const activeEnrollmentClass = (await database("turma").insert({ serie: 1, ano_letivo: 2097 }).returning("id_turma"))[0].id_turma;
+      const blockedStudentId = await insertStudent(database, newIdentity("student-delete-blocked"));
+      await database("matricula").insert({
+        id_usuario_aluno: blockedStudentId,
+        id_turma: activeEnrollmentClass,
+        inicio_vigencia: "2097-01-01"
+      });
+      const completedSimulation = (await database("simulado").insert({
+        id_turma: activeEnrollmentClass,
+        numero: 1,
+        tipo: "objetivo",
+        bimestre: 1,
+        data_realizacao: "2097-02-01",
+        instante_confirmacao_realizacao: database.raw("clock_timestamp()")
+      }).returning("id_simulado"))[0].id_simulado;
+      await database("simulado_aluno").insert({
+        id_simulado: completedSimulation,
+        id_usuario_aluno: blockedStudentId
+      });
+      const activeStudentsByClass = await handlers.listStudents(accountRequest("GET", {
+        cookie: adminToken,
+        query: new URLSearchParams({
+          classId: String(activeEnrollmentClass),
+          enrollmentStatus: "active",
+          activationStatus: "activated"
+        })
+      }), {});
+      const blockedStudentItem = activeStudentsByClass.jsonBody.items
+        .find((item) => item.studentId === String(blockedStudentId));
+      assert.ok(blockedStudentItem);
+      assert.equal(blockedStudentItem.currentClass.schoolYear, 2097);
+      assert.ok(blockedStudentItem.enrollmentId);
+      const blockedStudentDetail = await handlers.getStudent(accountRequest("GET", {
+        cookie: adminToken,
+        params: { studentId: String(blockedStudentId) }
+      }), {});
+      assert.equal(blockedStudentDetail.jsonBody.enrollments.length, 1);
+      assert.equal(blockedStudentDetail.jsonBody.enrollmentStatus, "active");
+      const blockedDelete = await handlers.deleteStudent(accountRequest("DELETE", {
+        cookie: adminToken,
+        params: { studentId: String(blockedStudentId) }
+      }), {});
+      assertProblemResponse(blockedDelete, 409, "STUDENT_CANNOT_BE_DELETED");
+
+      const unblockedStudentId = await insertStudent(database, newIdentity("student-delete-allowed"));
+      await database("matricula").insert({
+        id_usuario_aluno: unblockedStudentId,
+        id_turma: activeEnrollmentClass,
+        inicio_vigencia: "2097-01-01"
+      });
+      const unblockedSession = await insertAuthSession(database, unblockedStudentId);
+      const unblockedDelete = await handlers.deleteStudent(accountRequest("DELETE", {
+        cookie: adminToken,
+        params: { studentId: String(unblockedStudentId) }
+      }), {});
+      assert.equal(unblockedDelete.status, 204);
+      assert.equal(unblockedDelete.jsonBody, undefined);
+      const deletedStudent = await database("usuario").where({ id_usuario: unblockedStudentId }).first();
+      assert.ok(deletedStudent.excluido_em);
+      const deletedStudentSession = await database("sessao")
+        .where({ hash_token_sha256: createHash("sha256").update(unblockedSession).digest() })
+        .first();
+      assert.ok(deletedStudentSession.revogada_em);
+
+      const linkedTeacherId = await insertProfessor(database, newIdentity("teacher-delete-linked"));
+      const subjectId = (await database("materia").insert({ nome: "Synthetic Teacher Filter Subject" }).returning("id_materia"))[0].id_materia;
+      const offerId = (await database("turma_disciplina").insert({
+        id_turma: activeEnrollmentClass,
+        id_materia: subjectId
+      }).returning("id_turma_disciplina"))[0].id_turma_disciplina;
+      await database("turma_disciplina_professor").insert({
+        id_turma_disciplina: offerId,
+        id_usuario_professor: linkedTeacherId
+      });
+      const filteredTeachers = await handlers.listTeachers(accountRequest("GET", {
+        cookie: adminToken,
+        query: new URLSearchParams({
+          classId: String(activeEnrollmentClass),
+          subjectId: String(subjectId),
+          search: "teacher-delete-linked"
+        })
+      }), {});
+      assert.equal(filteredTeachers.status, 200);
+      assert.deepEqual(filteredTeachers.jsonBody.items.map((item) => item.teacherId), [String(linkedTeacherId)]);
+      const linkedTeacherDelete = await handlers.deleteTeacher(accountRequest("DELETE", {
+        cookie: adminToken,
+        params: { teacherId: String(linkedTeacherId) }
+      }), {});
+      assertProblemResponse(linkedTeacherDelete, 409, "TEACHER_HAS_LINKED_DATA");
+      await database("turma_disciplina_professor").where({
+        id_turma_disciplina: offerId,
+        id_usuario_professor: linkedTeacherId
+      }).delete();
+      assert.equal((await handlers.deleteTeacher(accountRequest("DELETE", {
+        cookie: adminToken,
+        params: { teacherId: String(linkedTeacherId) }
+      }), {})).status, 204);
+
+      const selfDelete = await handlers.deleteAdministrator(accountRequest("DELETE", {
+        cookie: adminToken,
+        params: { administratorId: String(administrator.id) }
+      }), {});
+      assertProblemResponse(selfDelete, 409, "ADMINISTRATOR_CANNOT_DELETE_SELF");
+
+      const failedAttemptsBefore = outbox.length;
+      const lockedTargetId = createdStudentRow.id_usuario;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        assertProblemResponse(await handlers.updateStudent(accountRequest("PATCH", {
+          cookie: adminToken,
+          params: { studentId: String(lockedTargetId) },
+          body: { email: newIdentity("locked-reauth-email"), currentPassword: "synthetic-wrong-admin-password" }
+        }), {}), 401, "AUTHENTICATION_FAILED");
+      }
+      const lockedAccount = await database("usuario").where({ id_usuario: administrator.id }).first();
+      assert.equal(lockedAccount.falhas_login_na_janela, 5);
+      assert.ok(lockedAccount.bloqueado_ate);
+      assertProblemResponse(await handlers.updateStudent(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { studentId: String(lockedTargetId) },
+        body: { email: newIdentity("blocked-reauth-email"), currentPassword: administrator.password }
+      }), {}), 401, "AUTHENTICATION_FAILED");
+      const untouchedTarget = await database("usuario").where({ id_usuario: lockedTargetId }).first();
+      assert.equal(untouchedTarget.email_pendente, null);
+      assert.equal(outbox.length, failedAttemptsBefore);
+    });
+
+    await t.test("administrative account email changes are constrained by the shared address uniqueness rules", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("email-uniqueness-admin") });
+      const adminToken = await insertAuthSession(database, administrator.id);
+      const currentEmail = newIdentity("email-uniqueness-current");
+      const targetId = await insertStudent(database, currentEmail);
+      const desiredEmail = newIdentity("email-uniqueness-conflict");
+      await insertProfessor(database, desiredEmail);
+      const handlers = adminAccountHandlers(database, { async send() {} });
+
+      const response = await handlers.updateStudent(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { studentId: String(targetId) },
+        body: { email: desiredEmail, currentPassword: administrator.password }
+      }), {});
+      assertProblemResponse(response, 409, "EMAIL_ALREADY_IN_USE");
+      const target = await database("usuario").where({ id_usuario: targetId }).first();
+      assert.equal(target.email_institucional, currentEmail);
+      assert.equal(target.email_pendente, null);
+      assert.notEqual(target.ativado_em, null);
+    });
+
+    await t.test("email change serializes activation and invalidates a pre-change token atomically", async () => {
+      const oldEmail = newIdentity("activation-race-current");
+      const pendingEmail = newIdentity("activation-race-pending");
+      const userId = await insertPendingStudent(database, oldEmail);
+      const oldActivation = await issueActivationToken(database, String(userId));
+      assert.equal(oldActivation.status, "issued");
+
+      const updateApplication = `nm-email-update-${process.pid}`;
+      const activationApplication = `nm-activation-${process.pid}`;
+      const testConnection = connectionFromEnvironment(generatedDatabase);
+      const updateConnection = makeKnex({ ...testConnection, application_name: updateApplication }, {
+        min: 1,
+        max: 1,
+        acquireTimeoutMillis: 5000
+      });
+      const activationConnection = makeKnex({ ...testConnection, application_name: activationApplication }, {
+        min: 1,
+        max: 1,
+        acquireTimeoutMillis: 5000
+      });
+      const blocker = await database.transaction();
+      let updatePromise;
+      let activationPromise;
+
+      try {
+        await updateConnection.raw("SELECT 1");
+        await activationConnection.raw("SELECT 1");
+        await blocker("usuario").select("id_usuario").where({ id_usuario: userId }).forUpdate().first();
+
+        updatePromise = updateAccount(
+          updateConnection,
+          "aluno",
+          String(userId),
+          oldEmail,
+          { email: pendingEmail }
+        );
+        await waitForLockWait(database, updateApplication);
+
+        activationPromise = activateAccount(
+          activationConnection,
+          oldActivation.token,
+          "synthetic-activation-race-password"
+        );
+        await waitForLockWait(database, activationApplication);
+
+        await blocker.commit();
+        const [updated, activatedWithOldToken] = await Promise.all([updatePromise, activationPromise]);
+        assert.equal(updated.status, "updated");
+        assert.equal(updated.previousEmail, oldEmail);
+        assert.equal(activatedWithOldToken, false);
+
+        const account = await database("usuario").where({ id_usuario: userId }).first();
+        assert.equal(account.email_institucional, oldEmail);
+        assert.equal(account.email_pendente, pendingEmail);
+        assert.equal(account.ativado_em, null);
+        assert.equal(await database("token_ativacao").where({ id_usuario: userId }).count().first()
+          .then((row) => Number(row.count)), 0);
+
+        const replacement = await issueActivationToken(database, String(userId));
+        assert.equal(replacement.status, "issued");
+        assert.equal(replacement.recipient, pendingEmail);
+        const replacementRow = await database("token_ativacao").where({ id_usuario: userId }).first();
+        assert.equal(replacementRow.hash_token_sha256.equals(hashOpaqueToken(replacement.token)), true);
+      } finally {
+        if (!blocker.isCompleted()) await blocker.rollback();
+        await Promise.allSettled([updatePromise, activationPromise].filter(Boolean));
+        await Promise.all([updateConnection.destroy(), activationConnection.destroy()]);
+      }
+    });
+
+    await t.test("an administrator cannot change their own email or lose administrative access", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("self-email-admin") });
+      const adminToken = await insertAuthSession(database, administrator.id);
+      const activationToken = randomBytes(32).toString("base64url");
+      const activationHash = hashOpaqueToken(activationToken);
+      await database("token_ativacao").insert({
+        id_usuario: administrator.id,
+        hash_token_sha256: activationHash,
+        expira_em: database.raw("clock_timestamp() + INTERVAL '1 hour'")
+      });
+      const beforeAccount = await database("usuario")
+        .select("email_institucional", "email_pendente", "ativado_em", "hash_senha")
+        .where({ id_usuario: administrator.id })
+        .first();
+      const beforeTokens = await database("token_ativacao")
+        .select("hash_token_sha256", "expira_em")
+        .where({ id_usuario: administrator.id });
+      const handlers = adminAccountHandlers(database, { async send() { assert.fail("Self-email change must not send mail."); } });
+
+      const response = await handlers.updateAdministrator(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { administratorId: String(administrator.id) },
+        body: {
+          email: newIdentity("self-email-rejected"),
+          currentPassword: administrator.password
+        }
+      }), {});
+
+      assertProblemResponse(response, 422, "VALIDATION_ERROR");
+      assert.equal(response.jsonBody.errors[0].code, "INVALID_VALUE");
+      assert.deepEqual(response.jsonBody.errors[0].source, { in: "body", pointer: "/email" });
+      for (const secret of [administrator.email, administrator.password]) {
+        assert.equal(JSON.stringify(response).includes(secret), false);
+      }
+      const afterAccount = await database("usuario")
+        .select("email_institucional", "email_pendente", "ativado_em", "hash_senha")
+        .where({ id_usuario: administrator.id })
+        .first();
+      const afterTokens = await database("token_ativacao")
+        .select("hash_token_sha256", "expira_em")
+        .where({ id_usuario: administrator.id });
+      assert.deepEqual(afterAccount, beforeAccount);
+      assert.deepEqual(afterTokens, beforeTokens);
+      const current = await authHandlers(database).currentSession(authRequest("GET", { cookie: adminToken }), {});
+      assert.equal(current.status, 200);
+      assert.equal(current.jsonBody.user.id, String(administrator.id));
+      assert.equal((await database("sessao")
+        .where({ hash_token_sha256: createHash("sha256").update(adminToken).digest() })
+        .first()).revogada_em, null);
+    });
+
+    await t.test("administrative mutations and reauthentication emit minimal events, tolerating logger failures", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("event-admin") });
+      const adminToken = await insertAuthSession(database, administrator.id);
+      const studentEmail = newIdentity("event-student");
+      const studentId = await insertStudent(database, studentEmail);
+      const teacherEmail = newIdentity("event-teacher");
+      const teacherId = await insertProfessor(database, teacherEmail);
+      const newEmail = newIdentity("event-pending-email");
+      const messages = [];
+      const privateTransportFailure = "synthetic-private-provider-exception";
+      const handlers = adminAccountHandlers(database, {
+        async send(message) {
+          messages.push(message);
+          throw new Error(privateTransportFailure);
+        }
+      });
+      const logMessages = [];
+      const context = {
+        invocationId: "synthetic-admin-account-invocation",
+        log(message) { logMessages.push(message); }
+      };
+
+      const created = await handlers.createStudent(accountRequest("POST", {
+        cookie: adminToken,
+        body: { name: "Synthetic Event Student", email: newIdentity("event-created-student"), guardianPhone: "+5511999990000" }
+      }), context);
+      assert.equal(created.status, 201);
+      assert.deepEqual(created.jsonBody, { activationEmailStatus: "failed" });
+
+      const updated = await handlers.updateStudent(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { studentId: String(studentId) },
+        body: { email: newEmail, currentPassword: administrator.password }
+      }), context);
+      assert.equal(updated.status, 200);
+
+      const rejectedReauthentication = await handlers.updateTeacher(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { teacherId: String(teacherId) },
+        body: { email: newIdentity("event-rejected-email"), currentPassword: "synthetic-invalid-password" }
+      }), context);
+      assertProblemResponse(rejectedReauthentication, 401, "AUTHENTICATION_FAILED");
+
+      const deleted = await handlers.deleteTeacher(accountRequest("DELETE", {
+        cookie: adminToken,
+        params: { teacherId: String(teacherId) }
+      }), context);
+      assert.equal(deleted.status, 204);
+
+      const loggerFailure = await handlers.updateStudent(accountRequest("PATCH", {
+        cookie: adminToken,
+        params: { studentId: String(studentId) },
+        body: { name: "Synthetic Logger Failure Student" }
+      }), {
+        invocationId: "synthetic-throwing-logger",
+        log() { throw new Error("synthetic-private-log-sink-failure"); }
+      });
+      assert.equal(loggerFailure.status, 200);
+
+      const records = logMessages.map((message) => JSON.parse(message));
+      for (const record of records) {
+        assert.deepEqual(Object.keys(record).sort(), ["durationMs", "event", "invocationId", "result"]);
+        assert.equal(typeof record.event, "string");
+        assert.equal(record.invocationId, context.invocationId);
+        assert.equal(typeof record.result, "string");
+        assert.equal(typeof record.durationMs, "number");
+        assert.ok(record.durationMs >= 0);
+      }
+      assert.ok(records.some((record) => record.event === "admin_account_create" && record.result === "completed"));
+      assert.ok(records.some((record) => record.event === "admin_account_update" && record.result === "completed"));
+      assert.ok(records.some((record) => record.event === "admin_account_update" && record.result === "rejected"));
+      assert.ok(records.some((record) => record.event === "admin_account_delete" && record.result === "completed"));
+      assert.ok(records.some((record) => record.event === "admin_account_reauthentication" && record.result === "completed"));
+      assert.ok(records.some((record) => record.event === "admin_account_reauthentication" && record.result === "rejected"));
+
+      const logSensitiveValues = [
+        administrator.email,
+        administrator.password,
+        administrator.passwordHash,
+        adminToken,
+        studentEmail,
+        teacherEmail,
+        newEmail,
+        "+5511999990000",
+        privateTransportFailure,
+        "synthetic-private-log-sink-failure",
+        ...messages.flatMap((message) => [message.recipient, message.url])
+      ].filter((value) => typeof value === "string");
+      const loggedStringValues = records.flatMap((record) =>
+        [record.event, record.invocationId, record.result].filter((value) => typeof value === "string"));
+      for (const secret of logSensitiveValues) {
+        assert.equal(loggedStringValues.some((value) => value.includes(secret)), false);
+      }
+      const serializedResponses = JSON.stringify([created, updated, rejectedReauthentication, deleted, loggerFailure]);
+      const responseSecrets = [
+        administrator.password,
+        administrator.passwordHash,
+        adminToken,
+        privateTransportFailure,
+        "synthetic-private-log-sink-failure",
+        ...messages.map((message) => message.url)
+      ].filter((value) => typeof value === "string");
+      for (const secret of responseSecrets) assert.equal(serializedResponses.includes(secret), false);
+
+      const genericErrorResponse = JSON.stringify(rejectedReauthentication);
+      for (const privateValue of logSensitiveValues) {
+        assert.equal(genericErrorResponse.includes(privateValue), false);
+      }
+    });
+
     await t.test("admin activation resend authorizes, rotates hash-only tokens, and sanitizes transport failure", async () => {
       const administrator = await insertAuthAdministrator(database, { email: newIdentity("resend-admin") });
       const adminToken = await insertAuthSession(database, administrator.id);
@@ -1497,6 +2161,47 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
         id_turma: classId,
         id_materia: "9223372036854775807"
       }), "23503");
+    });
+
+    await t.test("serializes concurrent administrator deletion so one active account remains", async () => {
+      const previousActive = await database("usuario")
+        .select("id_usuario", "ativado_em")
+        .where({ tipo_perfil: "administrador" })
+        .whereNotNull("ativado_em")
+        .whereNull("excluido_em");
+      const previousIds = previousActive.map((row) => row.id_usuario);
+      try {
+        if (previousIds.length > 0) {
+          await database("usuario").whereIn("id_usuario", previousIds).update({ ativado_em: null });
+        }
+        const firstAdminId = await database.transaction((transaction) => insertUser(transaction, {
+          profile: "administrador",
+          email: newIdentity("concurrent-admin-delete-a"),
+          name: "Synthetic Concurrent Administrator A"
+        }));
+        const secondAdminId = await database.transaction((transaction) => insertUser(transaction, {
+          profile: "administrador",
+          email: newIdentity("concurrent-admin-delete-b"),
+          name: "Synthetic Concurrent Administrator B"
+        }));
+
+        const results = await Promise.all([
+          deleteAccount(database, "administrador", String(firstAdminId), String(secondAdminId)),
+          deleteAccount(secondConnection, "administrador", String(secondAdminId), String(firstAdminId))
+        ]);
+        assert.equal(results.filter((result) => result.status === "deleted").length, 1);
+        assert.equal(results.filter((result) => result.status === "last-active-administrator").length, 1);
+        const remainingActive = await database("usuario")
+          .where({ tipo_perfil: "administrador" })
+          .whereNotNull("ativado_em")
+          .whereNull("excluido_em")
+          .count();
+        assert.equal(Number(remainingActive[0].count), 1);
+      } finally {
+        for (const account of previousActive) {
+          await database("usuario").where({ id_usuario: account.id_usuario }).update({ ativado_em: account.ativado_em });
+        }
+      }
     });
   } finally {
     if (secondConnection) {

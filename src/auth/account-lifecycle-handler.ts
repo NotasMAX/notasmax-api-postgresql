@@ -3,6 +3,7 @@ import type { Knex } from "knex";
 import { z } from "zod";
 import { getKnex } from "../database/knex";
 import { createProblemResponse, validateInput, validateJsonBody } from "../http/validation";
+import { logSecurityEvent } from "../http/security-event";
 import {
   configuredOrigins,
   internalFailure,
@@ -16,7 +17,7 @@ import {
   issueActivationToken,
   reservePasswordReset
 } from "./account-lifecycle-service";
-import { accountActionUrl, createFakeEmailAdapter, type EmailTransport } from "./email-transport";
+import { accountActionUrl, resolveAccountEmailAdapter, type EmailTransport } from "./email-transport";
 
 const MAX_LIFECYCLE_BODY_BYTES = 8 * 1024;
 const passwordResetMessage = "Se houver uma conta ativa associada a este e-mail, enviaremos um link para redefinir sua senha.";
@@ -68,28 +69,10 @@ function alreadyActivated(): HttpResponseInit {
 }
 
 function deliveryAdapter(options: LifecycleHandlerOptions) {
-  if (!options.emailTransport) return createFakeEmailAdapter();
-  const webBaseUrl = options.webBaseUrl;
-  if (!webBaseUrl) throw new Error("Account email transport is unavailable.");
-  return { transport: options.emailTransport, webBaseUrl };
-}
-
-function logLifecycle(
-  context: InvocationContext,
-  event: string,
-  result: string,
-  startedAt: number
-): void {
-  try {
-    context.log(JSON.stringify({
-      event,
-      invocationId: context.invocationId,
-      result,
-      durationMs: Math.max(0, Date.now() - startedAt)
-    }));
-  } catch {
-    // A logging failure must not change an account lifecycle result.
-  }
+  return resolveAccountEmailAdapter({
+    transport: options.emailTransport,
+    webBaseUrl: options.webBaseUrl
+  });
 }
 
 export function createAccountLifecycleHandlers(options: LifecycleHandlerOptions = {}): {
@@ -110,7 +93,7 @@ export function createAccountLifecycleHandlers(options: LifecycleHandlerOptions 
     try {
       adapter = deliveryAdapter(options);
     } catch {
-      logLifecycle(context, "password_reset_request", "not-sent", startedAt);
+      logSecurityEvent(context, "password_reset_request", "not-sent", startedAt);
       return { status: 200, headers: { "cache-control": "no-store" }, jsonBody: { message: passwordResetMessage } };
     }
 
@@ -128,10 +111,10 @@ export function createAccountLifecycleHandlers(options: LifecycleHandlerOptions 
       } catch {
         // Reset requests keep their approved generic response when delivery fails.
       }
-      logLifecycle(context, "password_reset_request", "completed", startedAt);
+      logSecurityEvent(context, "password_reset_request", "completed", startedAt);
       return { status: 200, headers: { "cache-control": "no-store" }, jsonBody: { message: passwordResetMessage } };
     } catch {
-      logLifecycle(context, "password_reset_request", "failed", startedAt);
+      logSecurityEvent(context, "password_reset_request", "failed", startedAt);
       return internalFailure();
     }
   };
@@ -148,16 +131,16 @@ export function createAccountLifecycleHandlers(options: LifecycleHandlerOptions 
         validated.data.password
       );
       if (!completed) {
-        logLifecycle(_context, "password_reset_completion", "rejected", startedAt);
+        logSecurityEvent(_context, "password_reset_completion", "rejected", startedAt);
         return tokenFailure("password-reset");
       }
-      logLifecycle(_context, "password_reset_completion", "completed", startedAt);
+      logSecurityEvent(_context, "password_reset_completion", "completed", startedAt);
       return {
         status: 200,
         headers: { "cache-control": "no-store" }
       };
     } catch {
-      logLifecycle(_context, "password_reset_completion", "failed", startedAt);
+      logSecurityEvent(_context, "password_reset_completion", "failed", startedAt);
       return internalFailure();
     }
   };
@@ -170,16 +153,16 @@ export function createAccountLifecycleHandlers(options: LifecycleHandlerOptions 
     try {
       const activated = await activateAccountService(getDatabase(), validated.data.token, validated.data.password);
       if (!activated) {
-        logLifecycle(_context, "account_activation", "rejected", startedAt);
+        logSecurityEvent(_context, "account_activation", "rejected", startedAt);
         return tokenFailure("activation");
       }
-      logLifecycle(_context, "account_activation", "completed", startedAt);
+      logSecurityEvent(_context, "account_activation", "completed", startedAt);
       return {
         status: 200,
         headers: { "cache-control": "no-store" }
       };
     } catch {
-      logLifecycle(_context, "account_activation", "failed", startedAt);
+      logSecurityEvent(_context, "account_activation", "failed", startedAt);
       return internalFailure();
     }
   };
@@ -217,14 +200,14 @@ export function createAccountLifecycleHandlers(options: LifecycleHandlerOptions 
       } catch {
         result = "failed";
       }
-      logLifecycle(context, "activation_resend", result, startedAt);
+      logSecurityEvent(context, "activation_resend", result, startedAt);
       return {
         status: 200,
         headers: { "cache-control": "no-store" },
         jsonBody: { activationEmailStatus: result }
       };
     } catch {
-      logLifecycle(context, "activation_resend", "failed", startedAt);
+      logSecurityEvent(context, "activation_resend", "failed", startedAt);
       return internalFailure();
     }
   };

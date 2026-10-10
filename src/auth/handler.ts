@@ -59,7 +59,7 @@ function authenticationRequired(): HttpResponseInit {
   });
 }
 
-function authenticationFailed(): HttpResponseInit {
+export function authenticationFailed(): HttpResponseInit {
   return createProblemResponse({
     status: 401,
     title: "Falha de autenticação",

@@ -15,6 +15,7 @@ const PASSWORD_HASH_OPTIONS = {
 type UserLifecycleRow = {
   id_usuario: string | number;
   email_institucional: string;
+  email_pendente: string | null;
   hash_senha: string | null;
   ativado_em: Date | string | null;
   excluido_em: Date | string | null;
@@ -72,10 +73,11 @@ function isEligibleActiveAccount(account: AccountState): boolean {
 export async function issueActivationToken(knex: Knex, userId: string): Promise<ActivationIssueResult> {
   return knex.transaction(async (transaction) => {
     const account = await transaction("usuario")
-      .select("id_usuario", "email_institucional", "ativado_em", "excluido_em")
+      .select("id_usuario", "email_institucional", "email_pendente", "ativado_em", "excluido_em")
       .where({ id_usuario: userId })
       .forUpdate()
-      .first() as Pick<UserLifecycleRow, "id_usuario" | "email_institucional" | "ativado_em" | "excluido_em"> | undefined;
+      .first() as Pick<UserLifecycleRow,
+        "id_usuario" | "email_institucional" | "email_pendente" | "ativado_em" | "excluido_em"> | undefined;
 
     if (!account || account.excluido_em !== null) return { status: "not-found" };
     if (account.ativado_em !== null) return { status: "already-active" };
@@ -89,7 +91,7 @@ export async function issueActivationToken(knex: Knex, userId: string): Promise<
       hashOpaqueToken(token),
       new Date(now.getTime() + ACTIVATION_TOKEN_LIFETIME_MS)
     );
-    return { status: "issued", recipient: account.email_institucional, token };
+    return { status: "issued", recipient: account.email_pendente ?? account.email_institucional, token };
   });
 }
 
@@ -169,21 +171,20 @@ async function consumeTokenAndUpdateAccount(
 ): Promise<boolean> {
   try {
     return await knex.transaction(async (transaction) => {
-      if (!activate) {
-        // Session operations lock session rows before the account; keep that order to avoid cycles with login/inspection.
-        await transaction("sessao")
-          .select("id_sessao")
-          .where({ id_usuario: userId })
-          .whereNull("revogada_em")
-          .orderBy("id_sessao")
-          .forUpdate();
-      }
+      // Session operations lock session rows before the account; keep that order to avoid cycles with login/inspection.
+      await transaction("sessao")
+        .select("id_sessao")
+        .where({ id_usuario: userId })
+        .whereNull("revogada_em")
+        .orderBy("id_sessao")
+        .forUpdate();
 
       const account = await transaction("usuario")
-        .select("id_usuario", "hash_senha", "ativado_em", "excluido_em")
+        .select("id_usuario", "hash_senha", "email_pendente", "ativado_em", "excluido_em")
         .where({ id_usuario: userId })
         .forUpdate()
-        .first() as Pick<UserLifecycleRow, "id_usuario" | "hash_senha" | "ativado_em" | "excluido_em"> | undefined;
+        .first() as Pick<UserLifecycleRow,
+          "id_usuario" | "hash_senha" | "email_pendente" | "ativado_em" | "excluido_em"> | undefined;
       if (!account || account.excluido_em !== null) return false;
       if (activate ? account.ativado_em !== null : !isEligibleActiveAccount(account)) return false;
 
@@ -201,7 +202,14 @@ async function consumeTokenAndUpdateAccount(
       else userUpdate = userUpdate.whereNotNull("ativado_em");
 
       const update = activate
-        ? { hash_senha: passwordHash, ativado_em: transaction.raw("clock_timestamp()") }
+        ? {
+            hash_senha: passwordHash,
+            ...(account.email_pendente === null ? {} : {
+              email_institucional: account.email_pendente,
+              email_pendente: null
+            }),
+            ativado_em: transaction.raw("clock_timestamp()")
+          }
         : {
           hash_senha: passwordHash,
           contador_pedidos_redefinicao: 0,
@@ -210,7 +218,7 @@ async function consumeTokenAndUpdateAccount(
       const updated = await userUpdate.update(update).returning("id_usuario") as Array<{ id_usuario: string | number }>;
       if (updated.length !== 1) throw new LifecycleStateChanged();
 
-      if (!activate) {
+      if (!activate || account.email_pendente !== null) {
         await transaction("sessao")
           .where({ id_usuario: userId })
           .whereNull("revogada_em")
