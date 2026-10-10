@@ -652,6 +652,8 @@ test("all administrative account mutations reject Origin and custom-header failu
     [handlers.createTeacher, {}],
     [handlers.updateTeacher, { teacherId: "1" }],
     [handlers.deleteTeacher, { teacherId: "1" }],
+    [handlers.addClassSubjectTeacher, { classId: "1", subjectId: "1", teacherId: "1" }],
+    [handlers.removeClassSubjectTeacher, { classId: "1", subjectId: "1", teacherId: "1" }],
     [handlers.createAdministrator, {}],
     [handlers.updateAdministrator, { administratorId: "1" }],
     [handlers.deleteAdministrator, { administratorId: "1" }]
@@ -690,6 +692,35 @@ test("all administrative account mutations reject Origin and custom-header failu
     assert.equal(jsonCalls, 0);
   }
 
+  assert.equal(databaseCalls, 0);
+});
+
+test("teacher-association routes reject malformed IDs before database access", async () => {
+  let databaseCalls = 0;
+  const handlers = createAdminAccountHandlers({
+    getDatabase() { databaseCalls += 1; throw new Error("must not access database"); },
+    allowedOrigins: [allowedOrigin]
+  });
+  const headers = {
+    origin: allowedOrigin,
+    "x-requested-with": "XMLHttpRequest"
+  };
+
+  const list = await handlers.listClassSubjectTeachers({
+    method: "GET",
+    headers: new Headers(),
+    params: { classId: "0", subjectId: "1" }
+  }, noContext);
+  assertProblem(list, 400, "VALIDATION_ERROR");
+
+  for (const handler of [handlers.addClassSubjectTeacher, handlers.removeClassSubjectTeacher]) {
+    const response = await handler({
+      method: "PUT",
+      headers: new Headers(headers),
+      params: { classId: "1", subjectId: "1", teacherId: "9223372036854775808" }
+    }, noContext);
+    assertProblem(response, 400, "VALIDATION_ERROR");
+  }
   assert.equal(databaseCalls, 0);
 });
 

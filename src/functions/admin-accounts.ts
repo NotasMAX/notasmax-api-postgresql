@@ -73,6 +73,27 @@ app.http("adminTeacherDelete", {
   handler: handlers.deleteTeacher
 });
 
+app.http("adminClassSubjectTeachersList", {
+  methods: ["GET"],
+  authLevel: "anonymous",
+  route: "v1/admin/classes/{classId}/subjects/{subjectId}/teachers",
+  handler: handlers.listClassSubjectTeachers
+});
+
+app.http("adminClassSubjectTeacherAdd", {
+  methods: ["PUT"],
+  authLevel: "anonymous",
+  route: "v1/admin/classes/{classId}/subjects/{subjectId}/teachers/{teacherId}",
+  handler: handlers.addClassSubjectTeacher
+});
+
+app.http("adminClassSubjectTeacherRemove", {
+  methods: ["DELETE"],
+  authLevel: "anonymous",
+  route: "v1/admin/classes/{classId}/subjects/{subjectId}/teachers/{teacherId}",
+  handler: handlers.removeClassSubjectTeacher
+});
+
 app.http("adminAdministratorsList", {
   methods: ["GET"],
   authLevel: "anonymous",

@@ -1340,6 +1340,224 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       assert.equal(outbox.length, failedAttemptsBefore);
     });
 
+    await t.test("teacher associations are authorized, scoped, idempotent, and preserve teacher accounts", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("association-admin") });
+      const adminToken = await insertAuthSession(database, administrator.id);
+      const classId = (await database("turma").insert({ serie: 1, ano_letivo: 2091 })
+        .returning("id_turma"))[0].id_turma;
+      const otherClassId = (await database("turma").insert({ serie: 2, ano_letivo: 2091 })
+        .returning("id_turma"))[0].id_turma;
+      const subjectId = (await database("materia").insert({ nome: newIdentity("association-subject") })
+        .returning("id_materia"))[0].id_materia;
+      const offerId = (await database("turma_disciplina").insert({
+        id_turma: classId,
+        id_materia: subjectId
+      }).returning("id_turma_disciplina"))[0].id_turma_disciplina;
+      const firstTeacherId = await insertProfessor(database, newIdentity("association-first-teacher"));
+      const secondTeacherId = await insertProfessor(database, newIdentity("association-second-teacher"));
+      const pendingTeacherId = await database.transaction(async (transaction) => {
+        const id = await insertUser(transaction, {
+          profile: "professor",
+          email: newIdentity("association-pending-teacher"),
+          activated: false
+        });
+        await transaction("professor").insert({ id_usuario: id });
+        return id;
+      });
+      const handlers = adminAccountHandlers(database, { async send() {} });
+      const context = { invocationId: "synthetic-association", log(message) { logs.push(message); } };
+      const logs = [];
+      const route = (teacherId) => ({
+        classId: String(classId), subjectId: String(subjectId), teacherId: String(teacherId)
+      });
+
+      const empty = await handlers.listClassSubjectTeachers(accountRequest("GET", {
+        cookie: adminToken,
+        params: { classId: String(classId), subjectId: String(subjectId) }
+      }), context);
+      assert.equal(empty.status, 200);
+      assert.deepEqual(empty.jsonBody, { items: [] });
+
+      const nonAdminId = await insertStudent(database, newIdentity("association-non-admin"));
+      const nonAdminToken = await insertAuthSession(database, nonAdminId);
+      const associationQueries = [];
+      const queryListener = ({ sql }) => associationQueries.push(sql.toLowerCase());
+      database.on("query", queryListener);
+      let hiddenForStudent;
+      try {
+        hiddenForStudent = await handlers.listClassSubjectTeachers(accountRequest("GET", {
+          cookie: nonAdminToken,
+          params: { classId: String(classId), subjectId: String(subjectId) }
+        }), context);
+      } finally {
+        database.removeListener("query", queryListener);
+      }
+      assertProblemResponse(hiddenForStudent, 404, "RESOURCE_NOT_FOUND");
+      assert.equal(associationQueries.some((sql) => sql.includes("turma_disciplina_professor")), false);
+
+      const mismatchedOffer = await handlers.listClassSubjectTeachers(accountRequest("GET", {
+        cookie: adminToken,
+        params: { classId: String(otherClassId), subjectId: String(subjectId) }
+      }), context);
+      assertProblemResponse(mismatchedOffer, 404, "RESOURCE_NOT_FOUND");
+      const missingOffer = await handlers.addClassSubjectTeacher(accountRequest("PUT", {
+        cookie: adminToken,
+        params: { ...route(firstTeacherId), classId: "9223372036854775807" }
+      }), context);
+      assertProblemResponse(missingOffer, 404, "RESOURCE_NOT_FOUND");
+      const incompatibleAdd = await handlers.addClassSubjectTeacher(accountRequest("PUT", {
+        cookie: adminToken,
+        params: { ...route(firstTeacherId), classId: String(otherClassId) }
+      }), context);
+      assertProblemResponse(incompatibleAdd, 404, "RESOURCE_NOT_FOUND");
+      const incompatibleRemove = await handlers.removeClassSubjectTeacher(accountRequest("DELETE", {
+        cookie: adminToken,
+        params: { ...route(firstTeacherId), subjectId: "9223372036854775807" }
+      }), context);
+      assertProblemResponse(incompatibleRemove, 404, "RESOURCE_NOT_FOUND");
+      const missingTeacher = await handlers.addClassSubjectTeacher(accountRequest("PUT", {
+        cookie: adminToken,
+        params: { ...route("9223372036854775807") }
+      }), context);
+      assertProblemResponse(missingTeacher, 404, "RESOURCE_NOT_FOUND");
+      const studentAsTeacher = await handlers.addClassSubjectTeacher(accountRequest("PUT", {
+        cookie: adminToken,
+        params: route(nonAdminId)
+      }), context);
+      assertProblemResponse(studentAsTeacher, 404, "RESOURCE_NOT_FOUND");
+
+      const firstAdd = await handlers.addClassSubjectTeacher(accountRequest("PUT", {
+        cookie: adminToken, params: route(firstTeacherId)
+      }), context);
+      const repeatedAdd = await handlers.addClassSubjectTeacher(accountRequest("PUT", {
+        cookie: adminToken, params: route(firstTeacherId)
+      }), context);
+      const secondAdd = await handlers.addClassSubjectTeacher(accountRequest("PUT", {
+        cookie: adminToken, params: route(secondTeacherId)
+      }), context);
+      const pendingAdd = await handlers.addClassSubjectTeacher(accountRequest("PUT", {
+        cookie: adminToken, params: route(pendingTeacherId)
+      }), context);
+      for (const response of [firstAdd, repeatedAdd, secondAdd, pendingAdd]) assert.equal(response.status, 204);
+
+      const multiple = await handlers.listClassSubjectTeachers(accountRequest("GET", {
+        cookie: adminToken,
+        params: { classId: String(classId), subjectId: String(subjectId) }
+      }), context);
+      assert.equal(multiple.status, 200);
+      assert.deepEqual(multiple.jsonBody.items.map((item) => item.teacherId).sort((a, b) => Number(a) - Number(b)),
+        [String(firstTeacherId), String(secondTeacherId), String(pendingTeacherId)].sort((a, b) => Number(a) - Number(b)));
+      assert.deepEqual(Object.keys(multiple.jsonBody.items[0]).sort(), [
+        "activationStatus", "email", "name", "teacherId"
+      ]);
+      assert.equal(multiple.jsonBody.items.find((item) => item.teacherId === String(pendingTeacherId)).activationStatus,
+        "pending");
+      assert.equal(await database("turma_disciplina_professor").where({ id_turma_disciplina: offerId })
+        .count().first().then((row) => Number(row.count)), 3);
+
+      const linkedDelete = await handlers.deleteTeacher(accountRequest("DELETE", {
+        cookie: adminToken, params: { teacherId: String(firstTeacherId) }
+      }), context);
+      assertProblemResponse(linkedDelete, 409, "TEACHER_HAS_LINKED_DATA");
+
+      const removeOne = await handlers.removeClassSubjectTeacher(accountRequest("DELETE", {
+        cookie: adminToken, params: route(firstTeacherId)
+      }), context);
+      const repeatRemove = await handlers.removeClassSubjectTeacher(accountRequest("DELETE", {
+        cookie: adminToken, params: route(firstTeacherId)
+      }), context);
+      assert.equal(removeOne.status, 204);
+      assert.equal(repeatRemove.status, 204);
+      assert.equal(await database("turma_disciplina_professor").where({
+        id_turma_disciplina: offerId,
+        id_usuario_professor: firstTeacherId
+      }).first(), undefined);
+      assert.ok(await database("professor").where({ id_usuario: firstTeacherId }).first());
+      assert.equal((await handlers.deleteTeacher(accountRequest("DELETE", {
+        cookie: adminToken, params: { teacherId: String(firstTeacherId) }
+      }), context)).status, 204);
+
+      const deletedTeacherAdd = await handlers.addClassSubjectTeacher(accountRequest("PUT", {
+        cookie: adminToken, params: route(firstTeacherId)
+      }), context);
+      assertProblemResponse(deletedTeacherAdd, 404, "RESOURCE_NOT_FOUND");
+      const remaining = await handlers.listClassSubjectTeachers(accountRequest("GET", {
+        cookie: adminToken,
+        params: { classId: String(classId), subjectId: String(subjectId) }
+      }), context);
+      assert.deepEqual(remaining.jsonBody.items.map((item) => item.teacherId).sort((a, b) => Number(a) - Number(b)),
+        [String(secondTeacherId), String(pendingTeacherId)].sort((a, b) => Number(a) - Number(b)));
+
+      const logsParsed = logs.map((line) => JSON.parse(line));
+      assert.ok(logsParsed.some((entry) => entry.event === "admin_teacher_association_add"));
+      assert.ok(logsParsed.some((entry) => entry.event === "admin_teacher_association_remove"));
+      for (const entry of logsParsed) {
+        assert.deepEqual(Object.keys(entry).sort(), ["durationMs", "event", "invocationId", "result"]);
+        assert.equal(JSON.stringify(entry).includes("association-first-teacher"), false);
+      }
+
+      await expectPgCode(database("turma_disciplina_professor").insert({
+        id_turma_disciplina: offerId,
+        id_usuario_professor: "9223372036854775807"
+      }), "23503");
+    });
+
+    await t.test("teacher association and deletion serialize without leaving a deleted teacher linked", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("association-race-admin") });
+      const adminToken = await insertAuthSession(database, administrator.id);
+      const concurrentAdminToken = await insertAuthSession(database, administrator.id);
+      const classId = (await database("turma").insert({ serie: 3, ano_letivo: 2092 })
+        .returning("id_turma"))[0].id_turma;
+      const subjectId = (await database("materia").insert({ nome: newIdentity("association-race-subject") })
+        .returning("id_materia"))[0].id_materia;
+      await database("turma_disciplina").insert({ id_turma: classId, id_materia: subjectId });
+      const teacherId = await insertProfessor(database, newIdentity("association-race-teacher"));
+      const testConnection = connectionFromEnvironment(generatedDatabase);
+      const deletionApplication = `nm-association-delete-${process.pid}`;
+      const associationApplication = `nm-association-put-${process.pid}`;
+      const deletionConnection = makeKnex({ ...testConnection, application_name: deletionApplication }, {
+        min: 1, max: 1, acquireTimeoutMillis: 5000
+      });
+      const associationConnection = makeKnex({ ...testConnection, application_name: associationApplication }, {
+        min: 1, max: 1, acquireTimeoutMillis: 5000
+      });
+      const blocker = await database.transaction();
+      let deletePromise;
+      let addPromise;
+
+      try {
+        await deletionConnection.raw("SELECT 1");
+        await associationConnection.raw("SELECT 1");
+        await blocker("professor").select("id_usuario").where({ id_usuario: teacherId }).forUpdate().first();
+
+        const deletionHandlers = adminAccountHandlers(deletionConnection, { async send() {} });
+        const associationHandlers = adminAccountHandlers(associationConnection, { async send() {} });
+        deletePromise = deletionHandlers.deleteTeacher(accountRequest("DELETE", {
+          cookie: adminToken, params: { teacherId: String(teacherId) }
+        }), {});
+        await waitForLockWait(database, deletionApplication);
+
+        addPromise = associationHandlers.addClassSubjectTeacher(accountRequest("PUT", {
+          cookie: concurrentAdminToken,
+          params: { classId: String(classId), subjectId: String(subjectId), teacherId: String(teacherId) }
+        }), {});
+        await waitForLockWait(database, associationApplication);
+
+        await blocker.commit();
+        const [deleted, associated] = await Promise.all([deletePromise, addPromise]);
+        assert.equal(deleted.status, 204);
+        assertProblemResponse(associated, 404, "RESOURCE_NOT_FOUND");
+        assert.ok((await database("usuario").where({ id_usuario: teacherId }).first()).excluido_em);
+        assert.equal(await database("turma_disciplina_professor").where({
+          id_usuario_professor: teacherId
+        }).first(), undefined);
+      } finally {
+        if (!blocker.isCompleted()) await blocker.rollback();
+        await Promise.allSettled([deletePromise, addPromise].filter(Boolean));
+        await Promise.all([deletionConnection.destroy(), associationConnection.destroy()]);
+      }
+    });
+
     await t.test("administrative account email changes are constrained by the shared address uniqueness rules", async () => {
       const administrator = await insertAuthAdministrator(database, { email: newIdentity("email-uniqueness-admin") });
       const adminToken = await insertAuthSession(database, administrator.id);

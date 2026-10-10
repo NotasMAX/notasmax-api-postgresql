@@ -30,6 +30,11 @@ import {
   type EmailTransport
 } from "./email-transport";
 import { reauthenticateAdministrator } from "./session-service";
+import {
+  addCurrentTeacher,
+  listCurrentTeachers,
+  removeCurrentTeacher
+} from "./teacher-association-service";
 
 const MAX_ADMIN_ACCOUNT_BODY_BYTES = 8 * 1024;
 const MAX_POSTGRES_ID = 9223372036854775807n;
@@ -229,6 +234,9 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
   getTeacher: RequestHandler;
   updateTeacher: RequestHandler;
   deleteTeacher: RequestHandler;
+  listClassSubjectTeachers: RequestHandler;
+  addClassSubjectTeacher: RequestHandler;
+  removeClassSubjectTeacher: RequestHandler;
   listAdministrators: RequestHandler;
   createAdministrator: RequestHandler;
   getAdministrator: RequestHandler;
@@ -442,6 +450,73 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
     }
   );
 
+  const classSubjectPathSchema = z.strictObject({ classId: idSchema, subjectId: idSchema });
+  const teacherAssociationPathSchema = classSubjectPathSchema.extend({ teacherId: idSchema });
+
+  const listClassSubjectTeachers: RequestHandler = async (request) => {
+    const route = validateInput(classSubjectPathSchema, request.params, { in: "path" });
+    if (!route.success) return route.response;
+    const authorized = await requireAdminSession(request, getDatabase);
+    if (!authorized.authorized) return authorized.response;
+
+    try {
+      const result = await listCurrentTeachers(
+        getDatabase(), route.data.classId, route.data.subjectId
+      );
+      return result.status === "not-found"
+        ? resourceNotFound()
+        : { status: 200, headers: { "cache-control": "no-store" }, jsonBody: { items: result.items } };
+    } catch {
+      return internalFailure();
+    }
+  };
+
+  const addClassSubjectTeacher: RequestHandler = withSecurityEvent(
+    "admin_teacher_association_add",
+    async (request) => {
+      const rejected = mutationRejection(request, allowedOrigins);
+      if (rejected) return rejected;
+      const route = validateInput(teacherAssociationPathSchema, request.params, { in: "path" });
+      if (!route.success) return route.response;
+      const authorized = await requireAdminSession(request, getDatabase);
+      if (!authorized.authorized) return authorized.response;
+
+      try {
+        const result = await addCurrentTeacher(
+          getDatabase(), route.data.classId, route.data.subjectId, route.data.teacherId
+        );
+        return result.status === "not-found"
+          ? resourceNotFound()
+          : { status: 204, headers: { "cache-control": "no-store" } };
+      } catch {
+        return internalFailure();
+      }
+    }
+  );
+
+  const removeClassSubjectTeacher: RequestHandler = withSecurityEvent(
+    "admin_teacher_association_remove",
+    async (request) => {
+      const rejected = mutationRejection(request, allowedOrigins);
+      if (rejected) return rejected;
+      const route = validateInput(teacherAssociationPathSchema, request.params, { in: "path" });
+      if (!route.success) return route.response;
+      const authorized = await requireAdminSession(request, getDatabase);
+      if (!authorized.authorized) return authorized.response;
+
+      try {
+        const result = await removeCurrentTeacher(
+          getDatabase(), route.data.classId, route.data.subjectId, route.data.teacherId
+        );
+        return result.status === "not-found"
+          ? resourceNotFound()
+          : { status: 204, headers: { "cache-control": "no-store" } };
+      } catch {
+        return internalFailure();
+      }
+    }
+  );
+
   return {
     listStudents: list("aluno", studentQuerySchema),
     createStudent: create("aluno", studentCreateSchema),
@@ -453,6 +528,9 @@ export function createAdminAccountHandlers(options: AdminAccountHandlerOptions =
     getTeacher: get("professor", "teacherId"),
     updateTeacher: update("professor", "teacherId", personPatchSchema),
     deleteTeacher: remove("professor", "teacherId"),
+    listClassSubjectTeachers,
+    addClassSubjectTeacher,
+    removeClassSubjectTeacher,
     listAdministrators: list("administrador", administratorQuerySchema),
     createAdministrator: create("administrador", personCreateSchema),
     getAdministrator: get("administrador", "administratorId"),

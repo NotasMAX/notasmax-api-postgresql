@@ -161,6 +161,9 @@ Todas as rotas `/api/v1/admin/*` abaixo exigem sessão ativa de administrador ve
 | `GET /api/v1/admin/teachers` | Lista professores; aceita `search`, `classId`, `subjectId`, `page` e `pageSize`. Quando turma e matéria são informadas juntas, devem corresponder à mesma associação existente. |
 | `POST /api/v1/admin/teachers` | Cria professor pendente. Campos: `name`, `email` e `contactPhone` opcional. |
 | `GET`, `PATCH`, `DELETE /api/v1/admin/teachers/{teacherId}` | Consulta, edita ou faz exclusão lógica do professor. |
+| `GET /api/v1/admin/classes/{classId}/subjects/{subjectId}/teachers` | Lista em `{ items: [{ teacherId, name, email, activationStatus }] }` os professores associados atualmente à matéria oferecida pela turma; não há paginação. |
+| `PUT /api/v1/admin/classes/{classId}/subjects/{subjectId}/teachers/{teacherId}` | Adiciona a associação atual; permite vários professores e retorna `204`. Repetir a associação também retorna `204`. |
+| `DELETE /api/v1/admin/classes/{classId}/subjects/{subjectId}/teachers/{teacherId}` | Remove somente a associação atual, sem excluir o professor nem manter histórico; retorna `204`, inclusive se a associação já estiver ausente. |
 | `GET /api/v1/admin/administrators` | Lista administradores; aceita `search`, `page` e `pageSize`. |
 | `POST /api/v1/admin/administrators` | Cria administrador pendente. Campos: `name`, `email` e `contactPhone` opcional. |
 | `GET`, `PATCH`, `DELETE /api/v1/admin/administrators/{administratorId}` | Consulta, edita ou faz exclusão lógica do administrador. |
@@ -171,7 +174,7 @@ Criações retornam `201` com `activationEmailStatus: sent|failed`; falha síncr
 
 As mutações administrativas e os resultados de reautenticação emitem eventos mínimos pelo logger do contexto da Azure Function: `event`, `invocationId`, `result` e `durationMs`. Senhas, tokens, corpo da requisição, dados pessoais desnecessários e erros crus do PostgreSQL não são registrados. Esses eventos não são persistidos no banco de dados.
 
-As exclusões são lógicas e revogam sessões sem apagar vínculos. O aluno só é bloqueado quando tem matrícula ativa e vínculo com simulado realizado (`409 STUDENT_CANNOT_BE_DELETED`); o professor é bloqueado enquanto houver associação a matéria/turma (`409 TEACHER_HAS_LINKED_DATA`). Administradores não podem excluir a própria conta (`409 ADMINISTRATOR_CANNOT_DELETE_SELF`) nem remover o último administrador ativo (`409 LAST_ACTIVE_ADMIN_CANNOT_BE_DELETED`). As associações professor-matéria-turma continuam sendo gerenciadas por endpoints separados e não são criadas ou removidas por estas rotas.
+As exclusões são lógicas e revogam sessões sem apagar vínculos. O aluno só é bloqueado quando tem matrícula ativa e vínculo com simulado realizado (`409 STUDENT_CANNOT_BE_DELETED`); o professor é bloqueado enquanto houver associação a matéria/turma (`409 TEACHER_HAS_LINKED_DATA`). Administradores não podem excluir a própria conta (`409 ADMINISTRATOR_CANNOT_DELETE_SELF`) nem remover o último administrador ativo (`409 LAST_ACTIVE_ADMIN_CANNOT_BE_DELETED`). As mutações das associações validam a oferta turma/matéria e o perfil ativo do professor no servidor, são transacionais e não criam histórico. IDs inexistentes ou combinações incompatíveis retornam `404 RESOURCE_NOT_FOUND` com RFC 9457.
 
 ## Testes e verificações
 
