@@ -4,7 +4,7 @@
 
 Este repositório contém a fundação da nova API do NotasMAX. A aplicação usa Azure Functions v4 com Node.js e TypeScript. O acesso ao PostgreSQL é feito com Knex e `pg`.
 
-Atualmente, a API oferece a rota de verificação de saúde `GET /api/v1/health` e as rotas de sessão administrativa aprovadas nesta fase. A verificação de saúde confirma que a Function está respondendo e que consegue executar `SELECT 1` no PostgreSQL. As migrations criam o schema relacional inicial da V1 em uma base vazia; a base local ainda não recebe dados migrados do MongoDB nem rotas de negócio. O primeiro administrador é criado somente quando o seed manual é executado.
+Atualmente, a API oferece a rota de verificação de saúde `GET /api/v1/health`, as rotas de sessão administrativa e os fluxos compartilhados de ativação e recuperação de senha. A verificação de saúde confirma que a Function está respondendo e que consegue executar `SELECT 1` no PostgreSQL. As migrations criam o schema relacional inicial da V1 em uma base vazia; a base local ainda não recebe dados migrados do MongoDB nem rotas de CRUD administrativo. O primeiro administrador é criado somente quando o seed manual é executado.
 
 A estrutura principal é:
 
@@ -112,8 +112,13 @@ Os arquivos `.env` e `local.settings.json` são locais e ignorados pelo Git. Nã
 | `PGUSER` | Usuário de desenvolvimento | `notasmax` |
 | `PGPASSWORD` | Senha local de desenvolvimento | `local_dev_only` |
 | `NOTASMAX_WEB_ORIGINS` | Origens exatas autorizadas para mutações com sessão | `http://localhost:5173` |
+| `NODE_ENV` | Ambiente local/teste para habilitar o fake | `development` |
+| `NOTASMAX_EMAIL_TRANSPORT` | Adaptador fake habilitado somente em desenvolvimento/teste local | `fake` |
+| `NOTASMAX_WEB_BASE_URL` | Origem HTTPS usada nos links de ativação e redefinição | `https://localhost:5173` |
 
 O Docker Compose lê `.env` para configurar o contêiner PostgreSQL. O Azure Functions Core Tools e o carregador de testes leem `local.settings.json`. Variáveis já definidas no ambiente do processo prevalecem sobre os exemplos locais.
+
+O transporte `fake` apenas aceita a solicitação em memória: não entrega mensagens e não imprime nem retorna links ou tokens. Ele exige uma origem HTTPS e falha fechado quando detecta execução no Azure. Não configure credenciais de provedor de e-mail nesta fase.
 
 O PostgreSQL local escuta somente em `127.0.0.1:5432` e usa um volume Docker nomeado. Para parar o contêiner e preservar os dados locais:
 
@@ -132,6 +137,17 @@ docker compose down -v
 O website usa Vite, cuja porta local padrão é `5173`. Mantenha essa origem exata em `NOTASMAX_WEB_ORIGINS` no `local.settings.json` e na opção `--cors` do Core Tools, junto com `--cors-credentials`; não use `*`. Se o Vite iniciar em outra porta, atualize ambos os valores para a origem impressa pelo servidor. As origens devem coincidir exatamente, incluindo protocolo, host e porta.
 
 As operações que iniciam e encerram sessões também validam `Origin` e exigem `X-Requested-With: XMLHttpRequest` no servidor. O cookie de sessão é `HttpOnly; Secure; SameSite=None`; o desenvolvimento local usa HTTP em `localhost`, mantendo `Secure`. A validação do cookie no Safari fica para um ambiente HTTPS, conforme o escopo aprovado. As origens HTTPS da Azure devem ser configuradas quando os endereços existirem; nenhuma configuração ou publicação Azure faz parte desta fase.
+
+## Ciclo de vida de conta
+
+| Método e rota | Finalidade |
+|---|---|
+| `POST /api/v1/auth/password-reset-requests` | Solicita redefinição; a resposta `200` é genérica. Há no máximo três solicitações por conta em uma janela fixa de 24 horas. |
+| `POST /api/v1/auth/password-resets` | Consome token de redefinição de uso único, válido por uma hora, define a senha e revoga sessões existentes. |
+| `POST /api/v1/auth/activations` | Consome token de ativação de uso único, válido por 72 horas, define a senha escolhida e ativa a conta. |
+| `POST /api/v1/admin/users/{userId}/activation-resends` | Reenvia a ativação para conta pendente, exige sessão administrativa, origem permitida e `X-Requested-With`; responde `activationEmailStatus: sent|failed`. |
+
+Os tokens são aleatórios; somente hashes SHA-256 e expirações ficam no PostgreSQL. Cada nova emissão substitui o token anterior do mesmo fluxo. O contador e o início da janela de redefinição são campos aditivos em `usuario`, zerados após login bem-sucedido ou redefinição concluída. Um timer diário da própria Function App remove registros de token expirados. O transporte desta fase é exclusivamente `fake`; `sent` indica aceite pelo adaptador, não entrega. Links tokenizados não aparecem em logs ou respostas.
 
 ## Testes e verificações
 
@@ -218,7 +234,7 @@ Esse padrão fica disponível para endpoints aprovados em entregas futuras. Ele 
 
 ## GitHub Actions
 
-O fluxo de integração contínua definido em `.github/workflows/ci.yml` executa `npm ci`, `npm run lint` como etapa obrigatória, checagem de tipos, compilação, testes e `npm audit`, com um PostgreSQL `postgres:18.6-bookworm`. Os resultados de cada execução local ou remota são registrados no relatório DGF correspondente.
+O fluxo de integração contínua definido em `.github/workflows/ci.yml` executa `npm ci`, `npm run lint` como etapa obrigatória, checagem de tipos, compilação, testes e `npm audit`, com um PostgreSQL `postgres:18.6-bookworm`.
 
 ## Migrations e primeiro administrador
 
@@ -239,7 +255,7 @@ npm run db:seed:admin
 
 O seed solicita nome completo e e-mail; a senha é digitada sem eco no terminal, não há senha padrão e uma execução é recusada quando já existe administrador ativo. A senha é armazenada como hash Argon2id com os parâmetros aprovados. O seed deve ser executado em uma base local depois das migrations.
 
-Atualmente, a API não implementa regras de negócio nem rotas para a aplicação web e o aplicativo móvel. A autenticação administrativa está disponível somente por sessão na API; a integração web/mobile, a publicação na Azure e a migração de dados do MongoDB continuam fora desta fase.
+Esta fase disponibiliza os fluxos de autenticação e ciclo de vida compartilhados na API; CRUD administrativo por perfil, integração web/mobile, publicação na Azure e migração de dados do MongoDB continuam fora desta fase.
 
 ## Problemas comuns
 

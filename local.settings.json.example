@@ -4,11 +4,14 @@
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "FUNCTIONS_WORKER_RUNTIME": "node",
     "FUNCTIONS_EXTENSION_VERSION": "~4",
+    "NODE_ENV": "development",
     "PGHOST": "127.0.0.1",
     "PGPORT": "5432",
     "PGDATABASE": "notasmax",
     "PGUSER": "notasmax",
     "PGPASSWORD": "local_dev_only",
-    "NOTASMAX_WEB_ORIGINS": "http://localhost:5173"
+    "NOTASMAX_WEB_ORIGINS": "http://localhost:5173",
+    "NOTASMAX_EMAIL_TRANSPORT": "fake",
+    "NOTASMAX_WEB_BASE_URL": "https://localhost:5173"
   }
 }

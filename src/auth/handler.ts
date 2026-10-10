@@ -31,7 +31,7 @@ export type AdminGuardResult =
   | { authorized: true; user: SessionIdentity }
   | { authorized: false; response: HttpResponseInit };
 
-function configuredOrigins(): string[] {
+export function configuredOrigins(): string[] {
   return (process.env.NOTASMAX_WEB_ORIGINS || "")
     .split(",")
     .map((origin) => origin.trim())
@@ -69,7 +69,7 @@ function authenticationFailed(): HttpResponseInit {
   });
 }
 
-function resourceNotFound(): HttpResponseInit {
+export function resourceNotFound(): HttpResponseInit {
   return createProblemResponse({
     status: 404,
     title: "Recurso não encontrado",
@@ -79,7 +79,7 @@ function resourceNotFound(): HttpResponseInit {
   });
 }
 
-function internalFailure(): HttpResponseInit {
+export function internalFailure(): HttpResponseInit {
   return createProblemResponse({
     status: 500,
     title: "Erro interno",
@@ -88,7 +88,7 @@ function internalFailure(): HttpResponseInit {
   });
 }
 
-function mutationRejection(
+export function mutationRejection(
   request: HttpRequest,
   allowedOrigins: readonly string[]
 ): HttpResponseInit | undefined {

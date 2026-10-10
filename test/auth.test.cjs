@@ -4,6 +4,8 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const argon2 = require("argon2");
 const { createAuthHandlers, requireAdminSession } = require("../dist/auth/handler.js");
+const { createAccountLifecycleHandlers } = require("../dist/auth/account-lifecycle-handler.js");
+const { accountActionUrl, createFakeEmailAdapter } = require("../dist/auth/email-transport.js");
 const { createLoginSession } = require("../dist/auth/session-service.js");
 
 const allowedOrigin = "http://localhost:5173";
@@ -32,6 +34,53 @@ function assertProblem(response, status, code) {
   assert.equal(response.jsonBody.status, status);
   if (code) assert.equal(response.jsonBody.code, code);
   return response.jsonBody;
+}
+
+function createLoginRaceFixture(initialAccount) {
+  const state = {
+    account: { ...initialAccount },
+    snapshots: 0,
+    lockedReads: 0,
+    transactionCalls: 0,
+    insideTransaction: false,
+    updates: [],
+    sessions: []
+  };
+  const queryFor = (table, locked) => ({
+    select() { return this; },
+    where() { return this; },
+    whereNull() { return this; },
+    forUpdate() { return this; },
+    async first() {
+      if (table !== "usuario") return undefined;
+      if (locked) state.lockedReads += 1;
+      else state.snapshots += 1;
+      return { ...state.account };
+    },
+    async update(values) {
+      state.updates.push({ ...values });
+      Object.assign(state.account, values);
+      return 1;
+    },
+    async insert(values) {
+      state.sessions.push({ ...values });
+      return 1;
+    }
+  });
+  const transaction = (table) => queryFor(table, true);
+  transaction.raw = async () => ({ rows: [{ database_now: new Date("2026-10-09T12:00:00.000Z") }] });
+  const knex = Object.assign((table) => queryFor(table, false), {
+    async transaction(callback) {
+      state.transactionCalls += 1;
+      state.insideTransaction = true;
+      try {
+        return await callback(transaction);
+      } finally {
+        state.insideTransaction = false;
+      }
+    }
+  });
+  return { knex, state };
 }
 
 const noContext = { log() { throw new Error("Auth handler must not log request data."); } };
@@ -257,15 +306,25 @@ test("unknown-email login invokes Argon2 verification with the approved dummy ha
   const query = {
     select() { return this; },
     where() { return this; },
-    whereNull() { return this; },
-    forUpdate() { return this; },
     async first() { return undefined; }
   };
-  const transaction = Object.assign(() => query, { raw: async () => undefined });
-  const knex = { transaction: async (callback) => callback(transaction) };
+  let transactionCalls = 0;
+  let insideTransaction = false;
+  const knex = Object.assign(() => query, {
+    async transaction(callback) {
+      transactionCalls += 1;
+      insideTransaction = true;
+      try {
+        return await callback(Object.assign(() => query, { raw: async () => undefined }));
+      } finally {
+        insideTransaction = false;
+      }
+    }
+  });
   const originalVerify = argon2.verify;
   const hashes = [];
   argon2.verify = async (hash, candidate, ...rest) => {
+    assert.equal(insideTransaction, false);
     hashes.push(String(hash));
     return originalVerify(hash, candidate, ...rest);
   };
@@ -280,7 +339,200 @@ test("unknown-email login invokes Argon2 verification with the approved dummy ha
   }
 
   assert.equal(hashes.length, 1);
+  assert.equal(transactionCalls, 0);
   assert.match(hashes[0], /^\$argon2id\$v=19\$m=19456,(?:p=1,t=2|t=2,p=1)\$/);
+});
+
+test("known-account login runs Argon2 verification before opening a transaction", async () => {
+  const databaseNow = new Date("2026-10-09T12:00:00.000Z");
+  const account = {
+    id_usuario: "42",
+    email_institucional: "admin@example.test",
+    tipo_perfil: "administrador",
+    nome_completo: "Synthetic Administrator",
+    hash_senha: "synthetic-password-hash",
+    ativado_em: databaseNow,
+    excluido_em: null,
+    falhas_login_na_janela: 0,
+    inicio_janela_falhas_login: null,
+    bloqueado_ate: null
+  };
+  const updates = [];
+  const insertedSessions = [];
+  let insideTransaction = false;
+  const queryFor = (table) => ({
+    select() { return this; },
+    where() { return this; },
+    whereNull() { return this; },
+    forUpdate() { return this; },
+    async first() { return table === "usuario" ? account : undefined; },
+    async update(values) { updates.push(values); return 1; },
+    async insert(values) { insertedSessions.push(values); return 1; }
+  });
+  const transaction = Object.assign((table) => queryFor(table), {
+    async raw() { return { rows: [{ database_now: databaseNow }] }; }
+  });
+  const knex = Object.assign((table) => queryFor(table), {
+    async transaction(callback) {
+      insideTransaction = true;
+      try {
+        return await callback(transaction);
+      } finally {
+        insideTransaction = false;
+      }
+    }
+  });
+  const originalVerify = argon2.verify;
+  let verifyInsideTransaction = false;
+  argon2.verify = async () => {
+    verifyInsideTransaction = insideTransaction;
+    return true;
+  };
+
+  let result;
+  try {
+    result = await createLoginSession(knex, { email: account.email_institucional, password });
+  } finally {
+    argon2.verify = originalVerify;
+  }
+
+  assert.equal(verifyInsideTransaction, false);
+  assert.equal(result.success, true);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].contador_pedidos_redefinicao, 0);
+  assert.equal(updates[0].inicio_janela_redefinicao, null);
+  assert.equal(insertedSessions.length, 1);
+});
+
+test("stale password verification cannot create a session after the account hash changes", async () => {
+  const fixture = createLoginRaceFixture({
+    id_usuario: "42",
+    email_institucional: "admin@example.test",
+    tipo_perfil: "administrador",
+    nome_completo: "Synthetic Administrator",
+    hash_senha: "synthetic-old-hash",
+    ativado_em: new Date("2026-10-09T11:00:00.000Z"),
+    excluido_em: null,
+    falhas_login_na_janela: 0,
+    inicio_janela_falhas_login: null,
+    bloqueado_ate: null
+  });
+  const originalVerify = argon2.verify;
+  const verifiedHashes = [];
+  argon2.verify = async (hash) => {
+    assert.equal(fixture.state.insideTransaction, false);
+    verifiedHashes.push(String(hash));
+    if (verifiedHashes.length === 1) {
+      fixture.state.account.hash_senha = "synthetic-current-hash";
+      return true;
+    }
+    return false;
+  };
+
+  let result;
+  try {
+    result = await createLoginSession(fixture.knex, {
+      email: "admin@example.test",
+      password: "synthetic-stale-password"
+    });
+  } finally {
+    argon2.verify = originalVerify;
+  }
+
+  assert.deepEqual(verifiedHashes, ["synthetic-old-hash", "synthetic-current-hash"]);
+  assert.deepEqual(result, { success: false });
+  assert.equal(fixture.state.snapshots, 2);
+  assert.equal(fixture.state.lockedReads, 2);
+  assert.equal(fixture.state.sessions.length, 0);
+  assert.equal(fixture.state.updates.length, 1);
+});
+
+test("login retry verifies the current account hash after a concurrent password change", async () => {
+  const fixture = createLoginRaceFixture({
+    id_usuario: "43",
+    email_institucional: "admin@example.test",
+    tipo_perfil: "administrador",
+    nome_completo: "Synthetic Administrator",
+    hash_senha: "synthetic-before-reset-hash",
+    ativado_em: new Date("2026-10-09T11:00:00.000Z"),
+    excluido_em: null,
+    falhas_login_na_janela: 0,
+    inicio_janela_falhas_login: null,
+    bloqueado_ate: null
+  });
+  const originalVerify = argon2.verify;
+  const verifiedHashes = [];
+  argon2.verify = async (hash) => {
+    assert.equal(fixture.state.insideTransaction, false);
+    verifiedHashes.push(String(hash));
+    if (verifiedHashes.length === 1) {
+      fixture.state.account.hash_senha = "synthetic-after-reset-hash";
+      return false;
+    }
+    return String(hash) === "synthetic-after-reset-hash";
+  };
+
+  let result;
+  try {
+    result = await createLoginSession(fixture.knex, {
+      email: "admin@example.test",
+      password: "synthetic-current-password"
+    });
+  } finally {
+    argon2.verify = originalVerify;
+  }
+
+  assert.deepEqual(verifiedHashes, ["synthetic-before-reset-hash", "synthetic-after-reset-hash"]);
+  assert.equal(result.success, true);
+  assert.equal(fixture.state.snapshots, 2);
+  assert.equal(fixture.state.lockedReads, 2);
+  assert.equal(fixture.state.sessions.length, 1);
+  assert.equal(fixture.state.updates.length, 1);
+});
+
+test("login hash-change retries stop after the bounded attempt count", async () => {
+  const fixture = createLoginRaceFixture({
+    id_usuario: "44",
+    email_institucional: "admin@example.test",
+    tipo_perfil: "administrador",
+    nome_completo: "Synthetic Administrator",
+    hash_senha: "synthetic-racing-hash-0",
+    ativado_em: new Date("2026-10-09T11:00:00.000Z"),
+    excluido_em: null,
+    falhas_login_na_janela: 0,
+    inicio_janela_falhas_login: null,
+    bloqueado_ate: null
+  });
+  const originalVerify = argon2.verify;
+  const verifiedHashes = [];
+  argon2.verify = async (hash) => {
+    assert.equal(fixture.state.insideTransaction, false);
+    verifiedHashes.push(String(hash));
+    fixture.state.account.hash_senha = `synthetic-racing-hash-${verifiedHashes.length}`;
+    return true;
+  };
+
+  let result;
+  try {
+    result = await createLoginSession(fixture.knex, {
+      email: "admin@example.test",
+      password: "synthetic-password"
+    });
+  } finally {
+    argon2.verify = originalVerify;
+  }
+
+  assert.deepEqual(verifiedHashes, [
+    "synthetic-racing-hash-0",
+    "synthetic-racing-hash-1",
+    "synthetic-racing-hash-2"
+  ]);
+  assert.deepEqual(result, { success: false });
+  assert.equal(fixture.state.snapshots, 3);
+  assert.equal(fixture.state.lockedReads, 3);
+  assert.equal(fixture.state.transactionCalls, 3);
+  assert.equal(fixture.state.sessions.length, 0);
+  assert.equal(fixture.state.updates.length, 0);
 });
 
 test("administrator guard sanitizes unexpected database errors for future protected handlers", async () => {
@@ -325,4 +577,254 @@ test("unexpected database errors become sanitized RFC 9457 responses without log
   assert.equal(body.detail, "Não foi possível concluir a solicitação.");
   const serialized = JSON.stringify(response);
   for (const value of privateValues) assert.equal(serialized.includes(value), false);
+});
+
+test("fake email transport requires explicit local mode and an HTTPS host and never displays messages", async () => {
+  assert.throws(() => createFakeEmailAdapter({
+    NODE_ENV: "production",
+    NOTASMAX_EMAIL_TRANSPORT: "fake",
+    NOTASMAX_WEB_BASE_URL: "https://web.example.test"
+  }));
+  assert.throws(() => createFakeEmailAdapter({
+    NODE_ENV: "test",
+    NOTASMAX_EMAIL_TRANSPORT: "fake",
+    NOTASMAX_WEB_BASE_URL: "http://localhost:5173"
+  }));
+  assert.throws(() => createFakeEmailAdapter({
+    NODE_ENV: "test",
+    NOTASMAX_EMAIL_TRANSPORT: "fake",
+    NOTASMAX_WEB_BASE_URL: "https://web.example.test",
+    WEBSITE_SITE_NAME: "synthetic-function-app"
+  }));
+
+  const adapter = createFakeEmailAdapter({
+    NODE_ENV: "test",
+    NOTASMAX_EMAIL_TRANSPORT: "fake",
+    NOTASMAX_WEB_BASE_URL: "https://web.example.test"
+  });
+  const secretToken = "synthetic-token-that-must-not-be-displayed";
+  const message = {
+    kind: "activation",
+    recipient: "synthetic-user@example.test",
+    url: accountActionUrl(adapter.webBaseUrl, "activation", secretToken)
+  };
+  assert.equal(await adapter.transport.send(message), undefined);
+  assert.match(message.url, /^https:\/\/web\.example\.test\/ativar-conta\?token=/);
+  assert.equal(JSON.stringify(adapter).includes(secretToken), false);
+});
+
+test("account lifecycle validation reuses RFC 9457 and rejects malformed or invalid input before database access", async () => {
+  let databaseCalls = 0;
+  const handlers = createAccountLifecycleHandlers({
+    getDatabase() { databaseCalls += 1; throw new Error("must not access database"); },
+    allowedOrigins: [allowedOrigin],
+    emailTransport: { async send() {} },
+    webBaseUrl: "https://web.example.test"
+  });
+
+  const malformed = await handlers.requestPasswordReset(
+    request("POST", {}, new SyntaxError("synthetic-parser-secret")),
+    noContext
+  );
+  assertProblem(malformed, 400, "VALIDATION_ERROR");
+  assert.equal(JSON.stringify(malformed).includes("synthetic-parser-secret"), false);
+
+  const secretEmail = "private-invalid-email-value";
+  const invalidEmail = await handlers.requestPasswordReset(
+    request("POST", {}, { email: secretEmail }),
+    noContext
+  );
+  assertProblem(invalidEmail, 422, "VALIDATION_ERROR");
+  assert.equal(JSON.stringify(invalidEmail).includes(secretEmail), false);
+
+  const secretPassword = "short-secret";
+  const invalidPassword = await handlers.activate(
+    request("POST", {}, { token: "malformed-token", password: secretPassword }),
+    noContext
+  );
+  assertProblem(invalidPassword, 422, "VALIDATION_ERROR");
+  assert.equal(JSON.stringify(invalidPassword).includes(secretPassword), false);
+  assert.equal(databaseCalls, 0);
+});
+
+test("password-reset account states follow one database and fake-transport path without sending unreserved messages", async () => {
+  const now = new Date("2026-10-09T12:00:00.000Z");
+  const activeAccount = {
+    id_usuario: "51",
+    email_institucional: "synthetic-active@example.test",
+    hash_senha: "synthetic-password-hash",
+    ativado_em: new Date("2026-10-01T12:00:00.000Z"),
+    excluido_em: null,
+    contador_pedidos_redefinicao: 0,
+    inicio_janela_redefinicao: null
+  };
+  const cases = [
+    { name: "unknown", account: undefined, expected: "not-reserved" },
+    { name: "pending", account: { ...activeAccount, ativado_em: null, hash_senha: null }, expected: "not-reserved" },
+    { name: "deleted", account: { ...activeAccount, excluido_em: now }, expected: "not-reserved" },
+    {
+      name: "quota-exceeded",
+      account: {
+        ...activeAccount,
+        contador_pedidos_redefinicao: 3,
+        inicio_janela_redefinicao: new Date(now.getTime() - 60 * 60 * 1000)
+      },
+      expected: "not-reserved"
+    },
+    { name: "eligible", account: activeAccount, expected: "reserved" }
+  ];
+
+  const expectedOperations = ["account-read", "database-clock", "quota-update", "token-delete", "token-insert"];
+  for (const scenario of cases) {
+    const activity = { operations: [], accountUpdates: [], tokenConditions: [] };
+    const queryFor = (table) => ({
+      select() { return this; },
+      where() { return this; },
+      forUpdate() { return this; },
+      whereRaw(_sql, bindings) { this.shouldUpdate = bindings[0]; return this; },
+      async first() {
+        if (table !== "usuario") return undefined;
+        activity.operations.push("account-read");
+        return scenario.account ? { ...scenario.account } : undefined;
+      },
+      async update(values) {
+        activity.operations.push("quota-update");
+        activity.accountUpdates.push({ shouldUpdate: this.shouldUpdate, values: { ...values } });
+        return 1;
+      }
+    });
+    const transaction = (table) => queryFor(table);
+    transaction.raw = async (sql, bindings) => {
+      if (/clock_timestamp\(\)/.test(sql)) {
+        activity.operations.push("database-clock");
+        return { rows: [{ database_now: now }] };
+      }
+      if (/^DELETE FROM/.test(sql)) {
+        activity.operations.push("token-delete");
+        activity.tokenConditions.push({ operation: "delete", shouldPersist: bindings[2] });
+      } else if (/^INSERT INTO/.test(sql)) {
+        activity.operations.push("token-insert");
+        activity.tokenConditions.push({ operation: "insert", shouldPersist: bindings[4] });
+      }
+      else assert.fail("unexpected SQL operation");
+      return { rows: [] };
+    };
+    const knex = Object.assign(() => queryFor("usuario"), {
+      async transaction(callback) { return callback(transaction); }
+    });
+
+    const transportCalls = [];
+    const handlers = createAccountLifecycleHandlers({
+      getDatabase: () => knex,
+      allowedOrigins: [allowedOrigin],
+      emailTransport: { async send(message) { transportCalls.push(message); } },
+      webBaseUrl: "https://web.example.test"
+    });
+    const response = await handlers.requestPasswordReset(
+      request("POST", {}, { email: "synthetic-request@example.test" }),
+      { invocationId: "synthetic-reset-test", log() {} }
+    );
+    const reserved = scenario.expected === "reserved";
+    assert.equal(response.status, 200, scenario.name);
+    assert.equal(activity.operations.length, expectedOperations.length, scenario.name);
+    assert.deepEqual(activity.operations, expectedOperations, scenario.name);
+    assert.equal(activity.accountUpdates.length, 1, scenario.name);
+    assert.equal(activity.accountUpdates[0].shouldUpdate, reserved, scenario.name);
+    assert.deepEqual(activity.tokenConditions, [
+      { operation: "delete", shouldPersist: reserved },
+      { operation: "insert", shouldPersist: reserved }
+    ], scenario.name);
+    assert.equal(transportCalls.length, 1, scenario.name);
+    assert.equal(transportCalls[0] !== undefined, reserved, scenario.name);
+  }
+});
+
+test("malformed activation and reset tokens return uniform sanitized RFC 9457 errors", async () => {
+  const handlers = createAccountLifecycleHandlers({ getDatabase: () => ({}) });
+  const activationToken = "synthetic-activation-token";
+  const resetToken = "synthetic-reset-token";
+  const activation = await handlers.activate(request("POST", {}, {
+    token: activationToken,
+    password: "synthetic-valid-password-123"
+  }), noContext);
+  const reset = await handlers.completePasswordReset(request("POST", {}, {
+    token: resetToken,
+    password: "synthetic-valid-password-123"
+  }), noContext);
+
+  assertProblem(activation, 400, "ACTIVATION_TOKEN_INVALID");
+  assertProblem(reset, 400, "PASSWORD_RESET_TOKEN_INVALID");
+  assert.equal(JSON.stringify([activation, reset]).includes(activationToken), false);
+  assert.equal(JSON.stringify([activation, reset]).includes(resetToken), false);
+});
+
+test("administrative activation resend rejects Origin, custom-header, and malformed path before database access", async () => {
+  let databaseCalls = 0;
+  const handlers = createAccountLifecycleHandlers({
+    getDatabase() { databaseCalls += 1; throw new Error("must not access database"); },
+    allowedOrigins: [allowedOrigin],
+    emailTransport: { async send() {} },
+    webBaseUrl: "https://web.example.test"
+  });
+  const baseHeaders = { "x-requested-with": "XMLHttpRequest" };
+
+  for (const origin of [undefined, "null", "https://attacker.example.test"]) {
+    const headers = { ...baseHeaders };
+    if (origin !== undefined) headers.origin = origin;
+    const response = await handlers.resendActivation({
+      ...request("POST", headers),
+      params: { userId: "12" }
+    }, noContext);
+    assertProblem(response, 403, "ORIGIN_NOT_ALLOWED");
+  }
+
+  const missingHeader = await handlers.resendActivation({
+    ...request("POST", { origin: allowedOrigin }),
+    params: { userId: "12" }
+  }, noContext);
+  assertProblem(missingHeader, 403, "REQUEST_HEADER_REQUIRED");
+
+  for (const userId of ["0", "not-an-id", "9223372036854775808"]) {
+    const malformedPath = await handlers.resendActivation({
+      ...request("POST", { origin: allowedOrigin, "x-requested-with": "XMLHttpRequest" }),
+      params: { userId }
+    }, noContext);
+    assertProblem(malformedPath, 400, "VALIDATION_ERROR");
+    if (userId.length > 1) assert.equal(JSON.stringify(malformedPath).includes(userId), false);
+  }
+  assert.equal(databaseCalls, 0);
+});
+
+test("account lifecycle database errors are sanitized from responses and logs", async () => {
+  const privateValues = [
+    "private@example.test",
+    "synthetic-reset-token-secret",
+    "synthetic-password-secret",
+    "synthetic-hash-secret",
+    "203.0.113.77",
+    "SELECT * FROM usuario",
+    "raw-postgres-stack"
+  ];
+  const logs = [];
+  const handlers = createAccountLifecycleHandlers({
+    getDatabase: () => ({ async transaction() { throw new Error(privateValues.join(" ")); } }),
+    emailTransport: { async send() {} },
+    webBaseUrl: "https://web.example.test"
+  });
+  const response = await handlers.requestPasswordReset(request("POST", {}, {
+    email: "synthetic-user@example.test"
+  }), {
+    invocationId: "synthetic-invocation",
+    log(message) { logs.push(message); }
+  });
+
+  assertProblem(response, 500);
+  const publicOutput = JSON.stringify(response);
+  const loggedOutput = JSON.stringify(logs);
+  for (const value of privateValues) {
+    assert.equal(publicOutput.includes(value), false);
+    assert.equal(loggedOutput.includes(value), false);
+  }
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /password_reset_request/);
 });

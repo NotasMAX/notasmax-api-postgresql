@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const { createHash, randomBytes } = require("node:crypto");
 const path = require("node:path");
+const { URL } = require("node:url");
 const { test } = require("node:test");
 const argon2 = require("argon2");
 const knexFactory = require("knex");
@@ -10,6 +11,14 @@ const { Client } = require("pg");
 const { assertLoopbackHost } = require("../src/database/local-only.cjs");
 const { createInitialAdmin } = require("../seed/admin.cjs");
 const { createAuthHandlers, requireAdminSession } = require("../dist/auth/handler.js");
+const { createAccountLifecycleHandlers } = require("../dist/auth/account-lifecycle-handler.js");
+const {
+  activateAccount,
+  completePasswordReset,
+  deleteExpiredLifecycleTokens,
+  issueActivationToken
+} = require("../dist/auth/account-lifecycle-service.js");
+const { hashOpaqueToken } = require("../dist/auth/token-crypto.js");
 
 const AUTH_ORIGIN = "http://localhost:5173";
 const AUTH_PASSWORD = "synthetic-valid-admin-password";
@@ -61,14 +70,20 @@ function newIdentity(prefix) {
   return `${prefix}-${process.pid}-${identityCounter}@example.test`;
 }
 
-async function insertUser(transaction, { profile = "administrador", email, pendingEmail = null, name = "Synthetic User" }) {
+async function insertUser(transaction, {
+  profile = "administrador",
+  email,
+  pendingEmail = null,
+  name = "Synthetic User",
+  activated = true
+}) {
   const [row] = await transaction("usuario")
     .insert({
       tipo_perfil: profile,
       nome_completo: name,
       email_institucional: email,
       email_pendente: pendingEmail,
-      ativado_em: transaction.raw("CURRENT_TIMESTAMP")
+      ativado_em: activated ? transaction.raw("CURRENT_TIMESTAMP") : null
     })
     .returning("id_usuario");
   return row.id_usuario;
@@ -90,6 +105,23 @@ async function insertProfessor(database, email = newIdentity("professor")) {
   });
 }
 
+async function insertPendingStudent(database, email = newIdentity("pending-student")) {
+  return database.transaction(async (transaction) => {
+    const id = await insertUser(transaction, { profile: "aluno", email, activated: false });
+    await transaction("aluno").insert({ id_usuario: id, telefone_responsavel: "+5511999990000" });
+    return id;
+  });
+}
+
+async function syntheticPasswordHash(password = AUTH_PASSWORD) {
+  return argon2.hash(password, {
+    type: argon2.argon2id,
+    memoryCost: 19 * 1024,
+    timeCost: 2,
+    parallelism: 1
+  });
+}
+
 function authRequest(method, { origin = AUTH_ORIGIN, requestedWith = "XMLHttpRequest", cookie, body, forwardedFor } = {}) {
   const headers = new Headers();
   if (origin !== undefined) headers.set("origin", origin);
@@ -104,6 +136,23 @@ function authHandlers(database) {
     getDatabase: () => database,
     allowedOrigins: [AUTH_ORIGIN]
   });
+}
+
+function accountLifecycleHandlers(database, emailTransport) {
+  return createAccountLifecycleHandlers({
+    getDatabase: () => database,
+    allowedOrigins: [AUTH_ORIGIN],
+    emailTransport,
+    webBaseUrl: "https://web.example.test"
+  });
+}
+
+function accountRequest(method, { origin = AUTH_ORIGIN, requestedWith = "XMLHttpRequest", cookie, body, params } = {}) {
+  const headers = new Headers();
+  if (origin !== undefined) headers.set("origin", origin);
+  if (requestedWith !== undefined) headers.set("x-requested-with", requestedWith);
+  if (cookie !== undefined) headers.set("cookie", `notasmax_session=${cookie}`);
+  return { method, headers, params, json: async () => body };
 }
 
 function sessionCookie(response) {
@@ -181,13 +230,15 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       extension: "js"
     });
     assert.equal(batch, 1);
-    assert.equal(migrations.length, 3);
+    assert.equal(migrations.length, 4);
 
     await t.test("admin login creates hash-only session, rotates it on login, and logout revokes it", async () => {
       const account = await insertAuthAdministrator(database);
       await database("usuario").where({ id_usuario: account.id }).update({
         falhas_login_na_janela: 2,
-        inicio_janela_falhas_login: database.raw("clock_timestamp() - INTERVAL '1 minute'")
+        inicio_janela_falhas_login: database.raw("clock_timestamp() - INTERVAL '1 minute'"),
+        contador_pedidos_redefinicao: 2,
+        inicio_janela_redefinicao: database.raw("clock_timestamp() - INTERVAL '1 hour'")
       });
       const handlers = authHandlers(database);
       const login = await handlers.createSession(authRequest("POST", {
@@ -224,11 +275,17 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       assert.equal(new Date(firstSession.expira_absoluta_em).getTime() - new Date(firstSession.criada_em).getTime(),
         8 * 60 * 60 * 1000);
       const resetAccount = await database("usuario").where({ id_usuario: account.id }).first(
-        "falhas_login_na_janela", "inicio_janela_falhas_login", "bloqueado_ate"
+        "falhas_login_na_janela",
+        "inicio_janela_falhas_login",
+        "bloqueado_ate",
+        "contador_pedidos_redefinicao",
+        "inicio_janela_redefinicao"
       );
       assert.equal(resetAccount.falhas_login_na_janela, 0);
       assert.equal(resetAccount.inicio_janela_falhas_login, null);
       assert.equal(resetAccount.bloqueado_ate, null);
+      assert.equal(resetAccount.contador_pedidos_redefinicao, 0);
+      assert.equal(resetAccount.inicio_janela_redefinicao, null);
       const loginPublic = JSON.stringify({ headers: login.headers, jsonBody: login.jsonBody });
       for (const secret of [account.email, account.password, account.passwordHash, firstCookie.value, "203.0.113.55"]) {
         assert.equal(loginPublic.includes(secret), false);
@@ -552,6 +609,402 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
       }), {})).status, 204);
     });
 
+    await t.test("password reset is generic, enforces the fixed account quota, and reopens after 24 hours", async () => {
+      const activeEmail = newIdentity("reset-quota-active");
+      const activeId = await insertStudent(database, activeEmail);
+      const passwordHash = await syntheticPasswordHash();
+      await database("usuario").where({ id_usuario: activeId }).update({ hash_senha: passwordHash });
+      const pendingEmail = newIdentity("reset-quota-pending");
+      const pendingId = await insertPendingStudent(database, pendingEmail);
+      const deletedEmail = newIdentity("reset-quota-deleted");
+      const deletedId = await insertStudent(database, deletedEmail);
+      await database("usuario").where({ id_usuario: deletedId }).update({
+        excluido_em: database.raw("clock_timestamp()")
+      });
+      const sent = [];
+      const transportCalls = [];
+      const logs = [];
+      const handlers = accountLifecycleHandlers(database, {
+        async send(message) {
+          transportCalls.push(message);
+          if (message) sent.push(message);
+        }
+      });
+      const context = { invocationId: "synthetic-reset-invocation", log(message) { logs.push(message); } };
+      const requestReset = (email) => handlers.requestPasswordReset(accountRequest("POST", {
+        body: { email }
+      }), context);
+      const unknown = await requestReset(newIdentity("unknown-reset"));
+      const pending = await requestReset(pendingEmail);
+      const deleted = await requestReset(deletedEmail);
+      const expectedBody = {
+        message: "Se houver uma conta ativa associada a este e-mail, enviaremos um link para redefinir sua senha."
+      };
+      for (const response of [unknown, pending, deleted]) {
+        assert.equal(response.status, 200);
+        assert.deepEqual(response.jsonBody, expectedBody);
+        assert.equal(response.headers["cache-control"], "no-store");
+      }
+      assert.equal(transportCalls.length, 3);
+      assert.equal(sent.length, 0);
+      for (const id of [pendingId, deletedId]) {
+        const account = await database("usuario").where({ id_usuario: id }).first(
+          "contador_pedidos_redefinicao", "inicio_janela_redefinicao"
+        );
+        assert.equal(account.contador_pedidos_redefinicao, 0);
+        assert.equal(account.inicio_janela_redefinicao, null);
+        assert.equal(await database("token_redefinicao_senha").where({ id_usuario: id }).first(), undefined);
+      }
+
+      const activeResponses = [];
+      for (let index = 0; index < 3; index += 1) activeResponses.push(await requestReset(activeEmail));
+      for (const response of activeResponses) {
+        assert.equal(response.status, 200);
+        assert.deepEqual(response.jsonBody, expectedBody);
+      }
+      assert.equal(transportCalls.length, 6);
+      assert.equal(sent.length, 3);
+      const firstToken = new URL(sent[0].url).searchParams.get("token");
+      const thirdToken = new URL(sent[2].url).searchParams.get("token");
+      const currentToken = await database("token_redefinicao_senha").where({ id_usuario: activeId }).first();
+      assert.equal(currentToken.hash_token_sha256.equals(hashOpaqueToken(thirdToken)), true);
+      assert.equal(currentToken.hash_token_sha256.equals(Buffer.from(thirdToken)), false);
+      const resetLifetime = new Date(currentToken.expira_em).getTime() - Date.now();
+      assert.ok(resetLifetime <= 60 * 60 * 1000);
+      assert.ok(resetLifetime > 60 * 60 * 1000 - 10_000);
+      assert.equal(await completePasswordReset(database, firstToken, "synthetic-replacement-password-123"), false);
+
+      const overQuota = await requestReset(activeEmail);
+      assert.equal(overQuota.status, 200);
+      assert.deepEqual(overQuota.jsonBody, expectedBody);
+      assert.equal(transportCalls.length, 7);
+      assert.equal(transportCalls[6], undefined);
+      assert.equal(sent.length, 3);
+      const tokenAfterQuota = await database("token_redefinicao_senha").where({ id_usuario: activeId }).first();
+      assert.equal(tokenAfterQuota.id_token, currentToken.id_token);
+      assert.equal(tokenAfterQuota.hash_token_sha256.equals(currentToken.hash_token_sha256), true);
+      let quota = await database("usuario").where({ id_usuario: activeId }).first(
+        "contador_pedidos_redefinicao", "inicio_janela_redefinicao"
+      );
+      assert.equal(quota.contador_pedidos_redefinicao, 3);
+      assert.ok(quota.inicio_janela_redefinicao);
+
+      await database("usuario").where({ id_usuario: activeId }).update({
+        contador_pedidos_redefinicao: 3,
+        inicio_janela_redefinicao: database.raw("clock_timestamp() - INTERVAL '24 hours'")
+      });
+      const afterWindow = await requestReset(activeEmail);
+      assert.deepEqual(afterWindow.jsonBody, expectedBody);
+      assert.equal(transportCalls.length, 8);
+      assert.equal(sent.length, 4);
+      quota = await database("usuario").where({ id_usuario: activeId }).first(
+        "contador_pedidos_redefinicao", "inicio_janela_redefinicao"
+      );
+      assert.equal(quota.contador_pedidos_redefinicao, 1);
+      assert.ok(new Date(quota.inicio_janela_redefinicao).getTime() > Date.now() - 10_000);
+
+      const failureEmail = newIdentity("reset-delivery-failure");
+      const failureId = await insertStudent(database, failureEmail);
+      await database("usuario").where({ id_usuario: failureId }).update({ hash_senha: passwordHash });
+      let failedAttempts = 0;
+      const failedHandlers = accountLifecycleHandlers(database, {
+        async send() {
+          failedAttempts += 1;
+          throw new Error("synthetic-provider-secret");
+        }
+      });
+      const failedLogs = [];
+      const failedResponse = await failedHandlers.requestPasswordReset(accountRequest("POST", {
+        body: { email: failureEmail }
+      }), { invocationId: "synthetic-failure-invocation", log(message) { failedLogs.push(message); } });
+      assert.equal(failedResponse.status, 200);
+      assert.deepEqual(failedResponse.jsonBody, expectedBody);
+      assert.equal(failedAttempts, 1);
+      assert.equal(JSON.stringify(failedLogs).includes("synthetic-provider-secret"), false);
+      const failedQuota = await database("usuario").where({ id_usuario: failureId }).first(
+        "contador_pedidos_redefinicao"
+      );
+      assert.equal(failedQuota.contador_pedidos_redefinicao, 1);
+
+      const publicAndLogged = JSON.stringify([
+        unknown, pending, deleted, ...activeResponses, overQuota, afterWindow, failedResponse, logs, failedLogs
+      ]);
+      for (const secret of [activeEmail, pendingEmail, deletedEmail, failureEmail, firstToken, thirdToken, passwordHash,
+        "synthetic-provider-secret"]) {
+        assert.equal(publicAndLogged.includes(secret), false);
+      }
+    });
+
+    await t.test("separate connections reserve no more than three concurrent reset requests", async () => {
+      const email = newIdentity("concurrent-reset-quota");
+      const userId = await insertStudent(database, email);
+      await database("usuario").where({ id_usuario: userId }).update({ hash_senha: await syntheticPasswordHash() });
+      const sent = [];
+      let transportCalls = 0;
+      const transport = {
+        async send(message) {
+          transportCalls += 1;
+          if (message) sent.push(message);
+        }
+      };
+      const handlers = [accountLifecycleHandlers(database, transport), accountLifecycleHandlers(secondConnection, transport)];
+      const context = { invocationId: "synthetic-concurrent-reset", log() {} };
+      const responses = await Promise.all(Array.from({ length: 8 }, (_, index) => handlers[index % 2]
+        .requestPasswordReset(accountRequest("POST", { body: { email } }), context)));
+
+      assert.ok(responses.every((response) => response.status === 200));
+      assert.ok(responses.every((response) => response.jsonBody.message === responses[0].jsonBody.message));
+      assert.equal(transportCalls, 8);
+      assert.equal(sent.length, 3);
+      const account = await database("usuario").where({ id_usuario: userId }).first(
+        "contador_pedidos_redefinicao", "inicio_janela_redefinicao"
+      );
+      assert.equal(account.contador_pedidos_redefinicao, 3);
+      assert.ok(account.inicio_janela_redefinicao);
+      const tokenCount = await database("token_redefinicao_senha")
+        .where({ id_usuario: userId }).count({ count: "*" }).first();
+      assert.equal(Number(tokenCount.count), 1);
+      assert.equal(JSON.stringify(responses).includes(email), false);
+    });
+
+    await t.test("activation tokens are hash-only, expire, supersede, and consume once under concurrency", async () => {
+      const pendingId = await insertPendingStudent(database);
+      const first = await issueActivationToken(database, String(pendingId));
+      const firstPersisted = await database("token_ativacao").where({ id_usuario: pendingId }).first();
+      const second = await issueActivationToken(database, String(pendingId));
+      assert.equal(first.status, "issued");
+      assert.equal(second.status, "issued");
+      assert.notEqual(first.token, second.token);
+      const persisted = await database("token_ativacao").where({ id_usuario: pendingId }).first();
+      assert.equal(persisted.hash_token_sha256.equals(hashOpaqueToken(second.token)), true);
+      assert.notEqual(persisted.id_token, firstPersisted.id_token);
+      const activationLifetime = new Date(persisted.expira_em).getTime() - Date.now();
+      assert.ok(activationLifetime <= 72 * 60 * 60 * 1000);
+      assert.ok(activationLifetime > 72 * 60 * 60 * 1000 - 10_000);
+      assert.equal(await activateAccount(database, first.token, "synthetic-activation-password-123"), false);
+
+      const activationPasswordA = "synthetic-activation-password-a-123";
+      const activationPasswordB = "synthetic-activation-password-b-123";
+      const activationResults = await Promise.all([
+        activateAccount(database, second.token, activationPasswordA),
+        activateAccount(database, second.token, activationPasswordB)
+      ]);
+      assert.equal(activationResults.filter(Boolean).length, 1);
+      const activated = await database("usuario").where({ id_usuario: pendingId }).first(
+        "ativado_em", "hash_senha", "excluido_em"
+      );
+      assert.ok(activated.ativado_em);
+      assert.equal(activated.excluido_em, null);
+      assert.equal(await argon2.verify(activated.hash_senha, activationPasswordA)
+        || await argon2.verify(activated.hash_senha, activationPasswordB), true);
+      assert.equal(await activateAccount(database, second.token, activationPasswordA), false);
+      assert.equal(await database("token_ativacao").where({ id_usuario: pendingId }).first(), undefined);
+
+      const expiredId = await insertPendingStudent(database);
+      const expired = await issueActivationToken(database, String(expiredId));
+      assert.equal(expired.status, "issued");
+      const expiredActivationRow = await database("token_ativacao").where({ id_usuario: expiredId }).first();
+      await database("token_ativacao").where({ id_usuario: expiredId }).update({
+        expira_em: database.raw("clock_timestamp() - INTERVAL '1 second'")
+      });
+      assert.equal(await activateAccount(database, expired.token, "synthetic-expired-activation-password"), false);
+      const stillPending = await database("usuario").where({ id_usuario: expiredId }).first("ativado_em");
+      assert.equal(stillPending.ativado_em, null);
+
+      const handlerId = await insertPendingStudent(database);
+      const handlerIssue = await issueActivationToken(database, String(handlerId));
+      const handlerPassword = "synthetic-http-activation-password-123";
+      const expiryLogs = [];
+      const expiryHandlers = accountLifecycleHandlers(database, { async send() {} });
+      const expiredResponse = await expiryHandlers.activate(accountRequest("POST", {
+        body: { token: expired.token, password: "synthetic-expired-activation-password" }
+      }), { invocationId: "synthetic-expired-activation", log(message) { expiryLogs.push(message); } });
+      assert.equal(expiredResponse.status, 400);
+      assert.equal(expiredResponse.jsonBody.code, "ACTIVATION_TOKEN_INVALID");
+      assert.equal(JSON.stringify(expiredResponse).includes(expired.token), false);
+      assert.equal(JSON.stringify(expiredResponse).includes(expiredActivationRow.hash_token_sha256.toString()), false);
+      assert.equal(JSON.stringify(expiryLogs).includes(expired.token), false);
+      assert.equal(JSON.stringify(expiryLogs).includes(expiredActivationRow.hash_token_sha256.toString()), false);
+      const handlers = accountLifecycleHandlers(database, { async send() {} });
+      const activationLogs = [];
+      const response = await handlers.activate(accountRequest("POST", {
+        body: { token: handlerIssue.token, password: handlerPassword }
+      }), { invocationId: "synthetic-activation", log(message) { activationLogs.push(message); } });
+      assert.equal(response.status, 200);
+      const persistedHandlerAccount = await database("usuario").where({ id_usuario: handlerId }).first("hash_senha");
+      for (const secret of [handlerIssue.token, handlerPassword, persistedHandlerAccount.hash_senha, second.recipient]) {
+        assert.equal(JSON.stringify(response).includes(secret), false);
+        assert.equal(JSON.stringify(activationLogs).includes(secret), false);
+      }
+    });
+
+    await t.test("password reset supersedes tokens, revokes sessions, resets quota, and consumes once concurrently", async () => {
+      const email = newIdentity("reset-token-lifecycle");
+      const userId = await insertStudent(database, email);
+      const oldPassword = "synthetic-old-password-123";
+      const oldHash = await syntheticPasswordHash(oldPassword);
+      await database("usuario").where({ id_usuario: userId }).update({
+        hash_senha: oldHash,
+        contador_pedidos_redefinicao: 1,
+        inicio_janela_redefinicao: database.raw("clock_timestamp() - INTERVAL '1 hour'")
+      });
+      const session = await insertAuthSession(database, userId);
+      const outbox = [];
+      const handlers = accountLifecycleHandlers(database, { async send(message) { outbox.push(message); } });
+      const resetLogs = [];
+      const context = { invocationId: "synthetic-reset-complete", log(message) { resetLogs.push(message); } };
+      await handlers.requestPasswordReset(accountRequest("POST", { body: { email } }), context);
+      const firstToken = new URL(outbox[0].url).searchParams.get("token");
+      const firstPersisted = await database("token_redefinicao_senha").where({ id_usuario: userId }).first();
+      await handlers.requestPasswordReset(accountRequest("POST", { body: { email } }), context);
+      const secondToken = new URL(outbox[1].url).searchParams.get("token");
+      assert.notEqual(firstToken, secondToken);
+      const secondPersisted = await database("token_redefinicao_senha").where({ id_usuario: userId }).first();
+      assert.notEqual(secondPersisted.id_token, firstPersisted.id_token);
+      assert.equal(await completePasswordReset(database, firstToken, "synthetic-stale-reset-password"), false);
+      const staleResponse = await handlers.completePasswordReset(accountRequest("POST", {
+        body: { token: firstToken, password: "synthetic-stale-reset-password" }
+      }), context);
+      assert.equal(staleResponse.status, 400);
+      assert.equal(staleResponse.jsonBody.code, "PASSWORD_RESET_TOKEN_INVALID");
+
+      const newPassword = "synthetic-new-password-123";
+      const response = await handlers.completePasswordReset(accountRequest("POST", {
+        body: { token: secondToken, password: newPassword }
+      }), context);
+      assert.equal(response.status, 200);
+      const updated = await database("usuario").where({ id_usuario: userId }).first(
+        "hash_senha", "contador_pedidos_redefinicao", "inicio_janela_redefinicao"
+      );
+      assert.equal(await argon2.verify(updated.hash_senha, newPassword), true);
+      assert.equal(updated.contador_pedidos_redefinicao, 0);
+      assert.equal(updated.inicio_janela_redefinicao, null);
+      const revokedSession = await database("sessao").where({ hash_token_sha256: hashOpaqueToken(session) }).first();
+      assert.ok(revokedSession.revogada_em);
+      assert.equal(await completePasswordReset(database, secondToken, "synthetic-repeat-reset-password"), false);
+      const replayResponse = await handlers.completePasswordReset(accountRequest("POST", {
+        body: { token: secondToken, password: "synthetic-repeat-reset-password" }
+      }), context);
+      assert.deepEqual(replayResponse.jsonBody, staleResponse.jsonBody);
+      for (const secret of [email, firstToken, secondToken, newPassword, updated.hash_senha, session]) {
+        assert.equal(JSON.stringify(response).includes(secret), false);
+        assert.equal(JSON.stringify(resetLogs).includes(secret), false);
+      }
+
+      const concurrentEmail = newIdentity("concurrent-reset-consume");
+      const concurrentId = await insertStudent(database, concurrentEmail);
+      await database("usuario").where({ id_usuario: concurrentId }).update({ hash_senha: oldHash });
+      await handlers.requestPasswordReset(accountRequest("POST", { body: { email: concurrentEmail } }), context);
+      const concurrentToken = new URL(outbox.at(-1).url).searchParams.get("token");
+      const passwordA = "synthetic-concurrent-reset-password-a";
+      const passwordB = "synthetic-concurrent-reset-password-b";
+      const outcomes = await Promise.all([
+        completePasswordReset(database, concurrentToken, passwordA),
+        completePasswordReset(secondConnection, concurrentToken, passwordB)
+      ]);
+      assert.equal(outcomes.filter(Boolean).length, 1);
+      const finalHash = (await database("usuario").where({ id_usuario: concurrentId }).first("hash_senha")).hash_senha;
+      assert.equal(await argon2.verify(finalHash, passwordA) || await argon2.verify(finalHash, passwordB), true);
+
+      const expiredEmail = newIdentity("expired-reset-token");
+      const expiredId = await insertStudent(database, expiredEmail);
+      await database("usuario").where({ id_usuario: expiredId }).update({ hash_senha: oldHash });
+      await handlers.requestPasswordReset(accountRequest("POST", { body: { email: expiredEmail } }), context);
+      const expiredToken = new URL(outbox.at(-1).url).searchParams.get("token");
+      await database("token_redefinicao_senha").where({ id_usuario: expiredId }).update({
+        expira_em: database.raw("clock_timestamp() - INTERVAL '1 second'")
+      });
+      assert.equal(await completePasswordReset(database, expiredToken, "synthetic-expired-reset-password"), false);
+      const expiredResponse = await handlers.completePasswordReset(accountRequest("POST", {
+        body: { token: expiredToken, password: "synthetic-expired-reset-password" }
+      }), context);
+      assert.deepEqual(expiredResponse.jsonBody, staleResponse.jsonBody);
+      assert.ok(await database("token_redefinicao_senha").where({ id_usuario: expiredId }).first());
+      const validCleanupId = await insertPendingStudent(database);
+      const validCleanupToken = await issueActivationToken(database, String(validCleanupId));
+      assert.equal(validCleanupToken.status, "issued");
+      await deleteExpiredLifecycleTokens(database);
+      assert.equal(await database("token_redefinicao_senha").where({ id_usuario: expiredId }).first(), undefined);
+      assert.ok(await database("token_ativacao").where({ id_usuario: validCleanupId }).first());
+    });
+
+    await t.test("admin activation resend authorizes, rotates hash-only tokens, and sanitizes transport failure", async () => {
+      const administrator = await insertAuthAdministrator(database, { email: newIdentity("resend-admin") });
+      const adminToken = await insertAuthSession(database, administrator.id);
+      const pendingId = await insertPendingStudent(database);
+      const messages = [];
+      const logs = [];
+      const handlers = accountLifecycleHandlers(database, { async send(message) { messages.push(message); } });
+      const context = { invocationId: "synthetic-resend", log(message) { logs.push(message); } };
+      const resend = () => handlers.resendActivation(accountRequest("POST", {
+        cookie: adminToken,
+        params: { userId: String(pendingId) }
+      }), context);
+
+      const firstResponse = await resend();
+      assert.equal(firstResponse.status, 200);
+      assert.deepEqual(firstResponse.jsonBody, { activationEmailStatus: "sent" });
+      const firstToken = new URL(messages[0].url).searchParams.get("token");
+      const firstPersisted = await database("token_ativacao").where({ id_usuario: pendingId }).first();
+      const secondResponse = await resend();
+      assert.deepEqual(secondResponse.jsonBody, { activationEmailStatus: "sent" });
+      const secondToken = new URL(messages[1].url).searchParams.get("token");
+      assert.notEqual(firstToken, secondToken);
+      const persisted = await database("token_ativacao").where({ id_usuario: pendingId }).first();
+      assert.equal(persisted.hash_token_sha256.equals(hashOpaqueToken(secondToken)), true);
+      assert.notEqual(persisted.id_token, firstPersisted.id_token);
+      assert.equal(persisted.hash_token_sha256.equals(Buffer.from(secondToken)), false);
+
+      let failedAttempts = 0;
+      const failedHandlers = accountLifecycleHandlers(database, {
+        async send() {
+          failedAttempts += 1;
+          throw new Error("synthetic-provider-stack-private");
+        }
+      });
+      const failed = await failedHandlers.resendActivation(accountRequest("POST", {
+        cookie: adminToken,
+        params: { userId: String(pendingId) }
+      }), context);
+      assert.equal(failed.status, 200);
+      assert.deepEqual(failed.jsonBody, { activationEmailStatus: "failed" });
+      assert.equal(failedAttempts, 1);
+      assert.equal(JSON.stringify(failed).includes("synthetic-provider-stack-private"), false);
+      assert.equal(JSON.stringify(logs).includes("synthetic-provider-stack-private"), false);
+      for (const secret of [administrator.email, administrator.password, administrator.passwordHash,
+        adminToken, firstToken, secondToken, messages[0].recipient, messages[0].url, messages[1].url]) {
+        assert.equal(JSON.stringify(logs).includes(secret), false);
+      }
+      for (const response of [firstResponse, secondResponse, failed]) {
+        for (const secret of [administrator.email, administrator.password, administrator.passwordHash,
+          adminToken, firstToken, secondToken, "+5511999990000"]) {
+          assert.equal(JSON.stringify(response).includes(secret), false);
+        }
+      }
+
+      const activated = await handlers.resendActivation(accountRequest("POST", {
+        cookie: adminToken,
+        params: { userId: String(administrator.id) }
+      }), context);
+      assert.equal(activated.status, 409);
+      assert.equal(activated.jsonBody.code, "ACCOUNT_ALREADY_ACTIVATED");
+      const missing = await handlers.resendActivation(accountRequest("POST", {
+        cookie: adminToken,
+        params: { userId: "9223372036854775807" }
+      }), context);
+      assert.equal(missing.status, 404);
+      assert.equal(missing.jsonBody.code, "RESOURCE_NOT_FOUND");
+
+      const nonAdminId = await insertStudent(database);
+      const nonAdminToken = await insertAuthSession(database, nonAdminId);
+      const nonAdminResponse = await handlers.resendActivation(accountRequest("POST", {
+        cookie: nonAdminToken,
+        params: { userId: String(pendingId) }
+      }), context);
+      assert.equal(nonAdminResponse.status, 404);
+      assert.equal(messages.length, 2);
+    });
+
     await t.test("creates precisely the 16 approved domain tables", async () => {
       const result = await database.raw(`
         SELECT tablename
@@ -561,6 +1014,78 @@ test("V1 schema, admin auth/session lifecycle, concurrency, and seed use a dispo
         ORDER BY tablename
       `);
       assert.deepEqual(result.rows.map((row) => row.tablename), EXPECTED_DOMAIN_TABLES);
+    });
+
+    await t.test("reset-quota migration adds the approved columns and nonnegative counter constraint", async () => {
+      const columns = await database.raw(`
+        SELECT column_name, data_type, is_nullable, column_default
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'usuario'
+          AND column_name IN ('contador_pedidos_redefinicao', 'inicio_janela_redefinicao')
+        ORDER BY column_name
+      `);
+      assert.deepEqual(columns.rows, [
+        {
+          column_name: "contador_pedidos_redefinicao",
+          data_type: "integer",
+          is_nullable: "NO",
+          column_default: "0"
+        },
+        {
+          column_name: "inicio_janela_redefinicao",
+          data_type: "timestamp with time zone",
+          is_nullable: "YES",
+          column_default: null
+        }
+      ]);
+
+      const constraintName = "usuario_contador_pedidos_redefinicao_ck";
+      const constraints = await database.raw(`
+        SELECT attribute.attname AS column_name,
+               pg_get_constraintdef(constraint_row.oid, true) AS definition
+        FROM pg_constraint AS constraint_row
+        JOIN pg_class AS table_row ON table_row.oid = constraint_row.conrelid
+        JOIN pg_namespace AS schema_row ON schema_row.oid = table_row.relnamespace
+        JOIN LATERAL unnest(constraint_row.conkey) AS constrained_column(attnum) ON true
+        JOIN pg_attribute AS attribute
+          ON attribute.attrelid = table_row.oid
+         AND attribute.attnum = constrained_column.attnum
+        WHERE schema_row.nspname = current_schema()
+          AND table_row.relname = 'usuario'
+          AND constraint_row.contype = 'c'
+          AND constraint_row.conname = ?
+        ORDER BY attribute.attnum
+      `, [constraintName]);
+      assert.equal(constraints.rows.length, 1);
+      assert.equal(constraints.rows[0].column_name, "contador_pedidos_redefinicao");
+      assert.match(
+        constraints.rows[0].definition,
+        /^CHECK \(\(?contador_pedidos_redefinicao >= 0\)?\)$/
+      );
+
+      let fixtureId;
+      try {
+        fixtureId = await insertUser(database, {
+          profile: "administrador",
+          email: newIdentity("negative-reset-counter")
+        });
+        await assert.rejects(
+          database("usuario")
+            .where({ id_usuario: fixtureId })
+            .update({ contador_pedidos_redefinicao: -1 }),
+          (error) => error.code === "23514" && error.constraint === constraintName
+        );
+        const fixture = await database("usuario")
+          .where({ id_usuario: fixtureId })
+          .first("contador_pedidos_redefinicao");
+        assert.equal(fixture.contador_pedidos_redefinicao, 0);
+      } finally {
+        if (fixtureId !== undefined) {
+          const deleted = await database("usuario").where({ id_usuario: fixtureId }).delete();
+          assert.equal(deleted, 1);
+        }
+      }
     });
 
     await t.test("serializes concurrent initial-admin seed attempts and stores only a password hash", async () => {
